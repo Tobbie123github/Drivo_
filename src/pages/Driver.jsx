@@ -50,7 +50,7 @@ export default function Driver() {
   const countdown = useRef(null);
   const firstFix = useRef(false);
 
-  // Check onboarding on mount — redirect if not complete
+  // Check onboarding on mount
   useEffect(() => {
     const check = async () => {
       try {
@@ -58,12 +58,12 @@ export default function Driver() {
         const p = r.data.driver;
         if (!p.IsOnboardingCompleted) {
           toast("Complete your onboarding to start driving 🚗", { icon: "📋" });
-          nav("/driver/onboarding");
+          setTimeout(() => nav("/driver/onboarding", { replace: true }), 100);
           return;
         }
         setProfile(p);
       } catch {
-        // If fetch fails let them through — backend will block anyway
+        // fail silently — backend will block anyway
       } finally {
         setCheckingOnboarding(false);
       }
@@ -175,14 +175,13 @@ export default function Driver() {
   useEffect(() => {
     if (panel === "history") loadHistory();
   }, [panel]);
-
   useEffect(() => {
     loadHistory();
   }, []);
 
   const startLocation = () => {
     if (!navigator.geolocation) {
-      toast.error("GPS not available on this device");
+      toast.error("GPS not available");
       return;
     }
     stopLocation();
@@ -222,11 +221,8 @@ export default function Driver() {
   };
 
   const recenterMap = () => {
-    if (driverPos) {
-      window._drivoMapFlyTo?.(driverPos);
-    } else {
-      toast("Waiting for GPS fix...", { icon: "📡" });
-    }
+    if (driverPos) window._drivoMapFlyTo?.(driverPos);
+    else toast("Waiting for GPS fix...", { icon: "📡" });
   };
 
   const accept = () => {
@@ -351,7 +347,7 @@ export default function Driver() {
               exit={{ x: -320 }}
               transition={{ type: "spring", damping: 30, stiffness: 300 }}
             >
-              <SideContent {...sideProps} />
+              <SideContent {...sideProps} onClose={() => setSideOpen(false)} />
             </motion.div>
           </>
         )}
@@ -378,15 +374,15 @@ export default function Driver() {
           }
         />
 
-        {/* Top bar */}
-        <div className="absolute top-0 left-0 right-0 flex items-center justify-between p-4 pointer-events-none">
+        {/* ← Top bar — NO pointer-events-none on parent */}
+        <div className="absolute top-0 left-0 right-0 flex items-center justify-between p-4">
           <button
             onClick={() => setSideOpen(true)}
-            className="lg:hidden pointer-events-auto w-11 h-11 glass-light dark:glass-dark rounded-2xl flex items-center justify-center shadow-card text-zinc-700 dark:text-zinc-200"
+            className="lg:hidden w-11 h-11 glass-light dark:glass-dark rounded-2xl flex items-center justify-center shadow-card text-zinc-700 dark:text-zinc-200 active:scale-95 transition-all"
           >
             <Menu size={20} />
           </button>
-          <div className="ml-auto flex items-center gap-2 pointer-events-auto">
+          <div className="ml-auto flex items-center gap-2">
             {speed != null && speed > 2 && (
               <motion.div
                 className="px-3 py-1.5 rounded-full text-xs font-bold glass-light dark:glass-dark shadow-sm text-zinc-700 dark:text-zinc-200 font-display"
@@ -413,7 +409,7 @@ export default function Driver() {
         </div>
 
         {/* Recenter button */}
-        <div className="absolute bottom-6 right-4 pointer-events-auto">
+        <div className="absolute bottom-6 right-4">
           <button
             onClick={recenterMap}
             className="w-12 h-12 glass-light dark:glass-dark rounded-2xl flex items-center justify-center shadow-float border border-zinc-200/50 dark:border-zinc-700/50 text-brand hover:bg-brand hover:text-white transition-all active:scale-95"
@@ -639,6 +635,7 @@ function SideContent({
   fmt,
   timeLeft,
   onDone,
+  onClose,
 }) {
   return (
     <>
@@ -981,13 +978,11 @@ function DriverRidePanel({
       >
         <div className="bg-zinc-50 dark:bg-zinc-800 rounded-3xl p-5">
           <Badge color="blue">Heading to pickup</Badge>
-          <div className="mt-3 space-y-1.5">
-            <div className="flex items-center gap-2 text-sm">
-              <span className="w-2 h-2 rounded-full bg-brand" />
-              <span className="text-zinc-600 dark:text-zinc-300 truncate">
-                {ride?.pickup_address || "Pickup location"}
-              </span>
-            </div>
+          <div className="mt-3 flex items-center gap-2 text-sm">
+            <span className="w-2 h-2 rounded-full bg-brand" />
+            <span className="text-zinc-600 dark:text-zinc-300 truncate">
+              {ride?.pickup_address || "Pickup location"}
+            </span>
           </div>
           <p className="text-brand font-black text-2xl mt-3 font-display">
             {fmt(ride?.estimated_fare)}

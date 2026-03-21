@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { Star, Menu, Wifi, WifiOff, LogOut } from "lucide-react";
 import { rideAPI, ratingAPI } from "../services/api";
@@ -296,7 +296,10 @@ export default function Rider() {
               exit={{ x: -320 }}
               transition={{ type: "spring", damping: 30, stiffness: 300 }}
             >
-              <SidebarContent {...sidebarProps} />
+              <SidebarContent
+                {...sidebarProps}
+                onClose={() => setSideOpen(false)}
+              />
             </motion.div>
           </>
         )}
@@ -315,15 +318,15 @@ export default function Rider() {
           driverLoc={driverLoc}
         />
 
-        {/* Top overlay */}
-        <div className="absolute top-0 left-0 right-0 flex items-center justify-between p-4 pointer-events-none">
+        {/* ← Top bar — NO pointer-events-none on parent div */}
+        <div className="absolute top-0 left-0 right-0 flex items-center justify-between p-4">
           <button
             onClick={() => setSideOpen(true)}
-            className="lg:hidden pointer-events-auto w-11 h-11 glass-light dark:glass-dark rounded-2xl flex items-center justify-center shadow-card text-zinc-700 dark:text-zinc-200"
+            className="lg:hidden w-11 h-11 glass-light dark:glass-dark rounded-2xl flex items-center justify-center shadow-card text-zinc-700 dark:text-zinc-200 active:scale-95 transition-all"
           >
             <Menu size={20} />
           </button>
-          <div className="ml-auto pointer-events-auto">
+          <div className="ml-auto">
             <div
               className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-semibold glass-light dark:glass-dark shadow-sm ${wsOk ? "text-brand" : "text-red-500"}`}
             >
@@ -333,7 +336,7 @@ export default function Rider() {
           </div>
         </div>
 
-        {/* Mobile bottom sheet — active ride states only */}
+        {/* Mobile bottom sheet — active ride states */}
         <AnimatePresence>
           {[S.accepted, S.arrived, S.ongoing, S.completed].includes(stage) && (
             <motion.div
@@ -437,6 +440,7 @@ function SidebarContent({
   cancelRide,
   fmt,
   setRatingOpen,
+  onClose,
 }) {
   return (
     <>
