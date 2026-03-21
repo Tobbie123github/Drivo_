@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from "react";
+import { useNavigate } from "react-router-dom";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   MapPin,
@@ -31,11 +32,13 @@ const S = {
 export default function Driver() {
   const { user, logout } = useAuth();
   const { isDark, toggle } = useTheme();
+  const nav = useNavigate();
+  const [checkingOnboarding, setCheckingOnboarding] = useState(true);
   const [stage, setStage] = useState(S.idle);
   const [isOnline, setIsOnline] = useState(false);
   const [ride, setRide] = useState(null);
   const [driverPos, setDriverPos] = useState(null);
-  const [speed, setSpeed] = useState(null); // km/h from GPS
+  const [speed, setSpeed] = useState(null);
   const [profile, setProfile] = useState(null);
   const [history, setHistory] = useState([]);
   const [panel, setPanel] = useState("ride");
@@ -43,9 +46,30 @@ export default function Driver() {
   const [sideOpen, setSideOpen] = useState(false);
   const [timeLeft, setTimeLeft] = useState(20);
   const [todayEarnings, setTodayEarnings] = useState(0);
-  const watchId = useRef(null); // GPS watchPosition ID
+  const watchId = useRef(null);
   const countdown = useRef(null);
   const firstFix = useRef(false);
+
+  // Check onboarding on mount — redirect if not complete
+  useEffect(() => {
+    const check = async () => {
+      try {
+        const r = await driverAPI.getProfile();
+        const p = r.data.driver;
+        if (!p.IsOnboardingCompleted) {
+          toast("Complete your onboarding to start driving 🚗", { icon: "📋" });
+          nav("/driver/onboarding");
+          return;
+        }
+        setProfile(p);
+      } catch {
+        // If fetch fails let them through — backend will block anyway
+      } finally {
+        setCheckingOnboarding(false);
+      }
+    };
+    check();
+  }, []);
 
   // Restore state
   useEffect(() => {
@@ -70,7 +94,6 @@ export default function Driver() {
   }, [stage, ride]);
 
   useEffect(() => {
-    loadProfile();
     driverWS.connect("/ws/driver");
     const u = [
       driverWS.on("connected", () => {
@@ -137,7 +160,6 @@ export default function Driver() {
       const rides = r.data.rides || r.data.data || r.rides || [];
       const list = Array.isArray(rides) ? rides : [];
       setHistory(list);
-      // Calculate today's earnings
       const today = new Date().toDateString();
       const earned = list
         .filter(
@@ -154,41 +176,28 @@ export default function Driver() {
     if (panel === "history") loadHistory();
   }, [panel]);
 
-  // Load history on mount to get today's earnings
   useEffect(() => {
     loadHistory();
   }, []);
 
-  // GPS using watchPosition — more precise and continuous
   const startLocation = () => {
     if (!navigator.geolocation) {
       toast.error("GPS not available on this device");
       return;
     }
-
-    // Stop any existing watch
     stopLocation();
     firstFix.current = false;
-
     watchId.current = navigator.geolocation.watchPosition(
       (pos) => {
-        const loc = {
-          lat: pos.coords.latitude,
-          lng: pos.coords.longitude,
-        };
+        const loc = { lat: pos.coords.latitude, lng: pos.coords.longitude };
         const kmh =
           pos.coords.speed != null ? Math.round(pos.coords.speed * 3.6) : null;
-
         setDriverPos(loc);
         setSpeed(kmh);
-
-        // Fly to position on first fix only
         if (!firstFix.current) {
           firstFix.current = true;
           window._drivoMapFlyTo?.(loc);
         }
-
-        // Send to backend
         if (driverWS.isConnected()) {
           driverWS.send("location_update", {
             latitude: loc.lat,
@@ -200,11 +209,7 @@ export default function Driver() {
         console.error("GPS error:", err.code, err.message);
         if (err.code === 1) toast.error("Please enable GPS / location access");
       },
-      {
-        enableHighAccuracy: true,
-        timeout: 10000,
-        maximumAge: 2000, // accept cached position up to 2s old
-      },
+      { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 },
     );
   };
 
@@ -280,10 +285,23 @@ export default function Driver() {
     localStorage.removeItem("drivo_driver_stage");
     localStorage.removeItem("drivo_driver_ride");
     loadProfile();
-    loadHistory(); // refresh earnings
+    loadHistory();
   };
 
   const fmt = (f) => (f ? `₦${Number(f).toLocaleString()}` : "—");
+
+  // Loading screen while checking onboarding
+  if (checkingOnboarding)
+    return (
+      <div
+        className={`h-screen w-screen flex items-center justify-center ${isDark ? "bg-zinc-950" : "bg-zinc-50"}`}
+      >
+        <div className="flex flex-col items-center gap-4">
+          <div className="w-10 h-10 border-2 border-brand/20 border-t-brand rounded-full animate-spin" />
+          <p className="text-zinc-500 text-sm font-medium">Loading...</p>
+        </div>
+      </div>
+    );
 
   const sideProps = {
     user,
@@ -369,7 +387,6 @@ export default function Driver() {
             <Menu size={20} />
           </button>
           <div className="ml-auto flex items-center gap-2 pointer-events-auto">
-            {/* Speed badge — only when moving */}
             {speed != null && speed > 2 && (
               <motion.div
                 className="px-3 py-1.5 rounded-full text-xs font-bold glass-light dark:glass-dark shadow-sm text-zinc-700 dark:text-zinc-200 font-display"
@@ -405,7 +422,7 @@ export default function Driver() {
           </button>
         </div>
 
-        {/* GPS status indicator — no fix yet */}
+        {/* GPS acquiring indicator */}
         <AnimatePresence>
           {isOnline && !driverPos && (
             <motion.div
@@ -625,7 +642,6 @@ function SideContent({
 }) {
   return (
     <>
-      {/* Header */}
       <div className="p-5 flex items-center justify-between flex-shrink-0 border-b border-zinc-100 dark:border-zinc-800">
         <div>
           <h1 className="text-2xl font-black text-zinc-900 dark:text-white font-display">
@@ -708,7 +724,6 @@ function SideContent({
           >
             <span>{icon}</span>
             {label}
-            {/* Pulse badge on ride tab when request comes in */}
             {k === "ride" && stage === S.requested && panel !== "ride" && (
               <span className="w-2 h-2 rounded-full bg-red-500 animate-pulse" />
             )}
@@ -743,7 +758,6 @@ function SideContent({
             />
           ) : (
             <div className="space-y-2">
-              {/* Today's earnings summary */}
               {todayEarnings > 0 && (
                 <div className="bg-brand/5 border border-brand/20 rounded-2xl p-3.5 flex items-center justify-between">
                   <div>
