@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "765401109452",
+    "project_id": "drivo-c5803",
+    "storage_bucket": "drivo-c5803.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:765401109452:android:4cec74a54ed0c83d518369",
+        "android_client_info": {
+          "package_name": "com.drivo.app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDizcRHcH6VAp_E1xMkfSSOmsyrvTV7NP8"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

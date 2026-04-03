@@ -1,0 +1,16 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Drivo</string>
+    <string name="title_activity_main">Drivo</string>
+    <string name="package_name">com.drivo.app</string>
+    <string name="custom_url_scheme">com.drivo.app</string>
+    <string name="capacitor_background_geolocation_notification_channel_name">
+    Drivo Driver Tracking
+</string>
+<string name="capacitor_background_geolocation_notification_icon">
+    mipmap/ic_launcher
+</string>
+<string name="capacitor_background_geolocation_notification_color">
+    #00C853
+</string>
+</resources>

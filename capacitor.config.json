@@ -1,0 +1,11 @@
+{
+  "appId": "com.drivo.app",
+  "appName": "Drivo",
+  "webDir": "dist",
+  "server": {
+    "androidScheme": "https"
+  },
+  "android": {
+    "useLegacyBridge": true
+  }
+}

@@ -1,6 +1,21 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { Star, Menu, Wifi, WifiOff, LogOut } from "lucide-react";
+import {
+  Star,
+  Menu,
+  Wifi,
+  WifiOff,
+  LogOut,
+  Clock,
+  RefreshCw,
+  Navigation,
+  Users,
+  X,
+  MapPin,
+  ChevronRight,
+  Zap,
+  Shield,
+} from "lucide-react";
 import { rideAPI, ratingAPI } from "../services/api";
 import { riderWS } from "../services/websocket";
 import { useAuth } from "../context/AuthContext";
@@ -15,7 +30,15 @@ import {
 } from "../components/ui";
 import DrivoMap from "../components/map/DrivoMap";
 import LocationSearch from "../components/LocationSearch";
+import ChatBox from "../components/ChatBox";
+import ScheduleModal from "../components/ScheduleModal";
+import RecurringModal from "../components/RecurringModal";
 import toast from "react-hot-toast";
+import { BackgroundGeolocation } from "@capgo/background-geolocation";
+import { Network } from "@capacitor/network";
+import { Capacitor } from "@capacitor/core";
+import { requestFCMToken, onForegroundMessage } from "../services/firebase";
+import { saveFCMToken } from "../services/api";
 
 const S = {
   idle: "idle",
@@ -29,10 +52,12 @@ const S = {
 export default function Rider() {
   const { user, logout } = useAuth();
   const { isDark, toggle } = useTheme();
+
   const [stage, setStage] = useState(S.idle);
   const [pickup, setPickup] = useState(null);
   const [dropoff, setDropoff] = useState(null);
   const [driverLoc, setDriverLoc] = useState(null);
+  const [riderLoc, setRiderLoc] = useState(null); // own GPS position
   const [ride, setRide] = useState(null);
   const [driverInfo, setDriverInfo] = useState(null);
   const [history, setHistory] = useState([]);
@@ -43,8 +68,20 @@ export default function Rider() {
   const [sideOpen, setSideOpen] = useState(false);
   const [wsOk, setWsOk] = useState(false);
   const [cancelling, setCancelling] = useState(false);
+  const [scheduleOpen, setScheduleOpen] = useState(false);
+  const [recurringOpen, setRecurringOpen] = useState(false);
+  const [scheduledAt, setScheduledAt] = useState(null);
+  const [poolCheck, setPoolCheck] = useState(null);
+  const [checkingPool, setCheckingPool] = useState(false);
+  const [rideMode, setRideMode] = useState("solo");
+  const [joinedPoolInfo, setJoinedPoolInfo] = useState(null);
+  const [chatActive, setChatActive] = useState(false);
+  const [routeInfo, setRouteInfo] = useState(null);
+
   const stageRef = useRef(stage);
   const rideRef = useRef(ride);
+  const watchId = useRef(null);
+  const bgRunning = useRef(false);
 
   useEffect(() => {
     stageRef.current = stage;
@@ -53,37 +90,28 @@ export default function Rider() {
     rideRef.current = ride;
   }, [ride]);
 
-  // Restore on mount
+  // Persist
   useEffect(() => {
-    const savedStage = localStorage.getItem("drivo_rider_stage");
-    const savedRide = localStorage.getItem("drivo_rider_ride");
-    const savedPickup = localStorage.getItem("drivo_rider_pickup");
-    const savedDropoff = localStorage.getItem("drivo_rider_dropoff");
-    const savedDriverInfo = localStorage.getItem("drivo_rider_driverinfo");
-    if (savedStage && savedStage !== "idle") setStage(savedStage);
-    if (savedRide) {
-      try {
-        setRide(JSON.parse(savedRide));
-      } catch {}
-    }
-    if (savedPickup) {
-      try {
-        setPickup(JSON.parse(savedPickup));
-      } catch {}
-    }
-    if (savedDropoff) {
-      try {
-        setDropoff(JSON.parse(savedDropoff));
-      } catch {}
-    }
-    if (savedDriverInfo) {
-      try {
-        setDriverInfo(JSON.parse(savedDriverInfo));
-      } catch {}
-    }
+    const ss = localStorage.getItem("drivo_rider_stage");
+    if (ss && ss !== "idle") setStage(ss);
+    try {
+      const sr = localStorage.getItem("drivo_rider_ride");
+      if (sr) setRide(JSON.parse(sr));
+    } catch {}
+    try {
+      const sp = localStorage.getItem("drivo_rider_pickup");
+      if (sp) setPickup(JSON.parse(sp));
+    } catch {}
+    try {
+      const sd = localStorage.getItem("drivo_rider_dropoff");
+      if (sd) setDropoff(JSON.parse(sd));
+    } catch {}
+    try {
+      const sdi = localStorage.getItem("drivo_rider_driverinfo");
+      if (sdi) setDriverInfo(JSON.parse(sdi));
+    } catch {}
   }, []);
 
-  // Save on change
   useEffect(() => {
     if (stage === "idle") {
       [
@@ -108,6 +136,7 @@ export default function Rider() {
     }
   }, [stage, ride, pickup, dropoff, driverInfo]);
 
+  // WebSocket
   useEffect(() => {
     riderWS.connect("/ws/rider");
     const u = [
@@ -116,6 +145,7 @@ export default function Rider() {
       riderWS.on("ride_accepted", (p) => {
         setDriverInfo(p);
         setStage(S.accepted);
+        setChatActive(true);
         toast.success(`🚗 ${p.driver_name} is on the way!`);
       }),
       riderWS.on("driver_is_here", () => {
@@ -132,27 +162,190 @@ export default function Rider() {
       riderWS.on("ride_completed", (p) => {
         setRide((r) => ({ ...r, ...p }));
         setStage(S.completed);
+        setChatActive(false);
       }),
       riderWS.on("rate_driver", () => {
         setTimeout(() => setRatingOpen(true), 1200);
       }),
       riderWS.on("ride_cancelled_by_driver", (p) => {
         toast.error(p?.message || "Driver cancelled");
+        setChatActive(false);
         reset();
       }),
-      riderWS.on("ride_cancelled_by_rider", () => reset()),
-      riderWS.on("no_candidates", (p) => {
-        toast.error(
-          p?.message || "No drivers available nearby. Please try again.",
-        );
+      riderWS.on("ride_cancelled_by_rider", () => {
+        setChatActive(false);
         reset();
+      }),
+      riderWS.on("no_candidates", (p) => {
+        toast.error(p?.message || "No drivers available. Please try again.");
+        reset();
+      }),
+      riderWS.on("pool_ride_available", () => {
+        toast("🚌 Pool ride available near you!", { duration: 5000 });
+      }),
+      riderWS.on("pool_ride_updated", (p) => {
+        if (p.new_fare) {
+          setRide((r) => ({ ...r, estimated_fare: p.new_fare }));
+          setJoinedPoolInfo((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  fare_per_head: p.new_fare,
+                  current_size: p.riders_count || prev.current_size,
+                }
+              : prev,
+          );
+          toast.success(p.message || "Pool fare updated!");
+        }
+      }),
+      riderWS.on("pool_ride_started", () => {
+        setStage(S.ongoing);
+        toast.success("🚀 Pool trip started!");
       }),
     ];
+
+    requestFCMToken()
+      .then((token) => {
+        if (token) saveFCMToken(token).catch(() => {});
+      })
+      .catch(() => {});
+
+    const unsubFCM = onForegroundMessage((payload) => {
+      const type = payload.data?.type;
+      if (type === "ride_accepted" && stageRef.current === S.idle) {
+        toast.success("🚗 Driver found!");
+      }
+      if (type === "driver_arrived") {
+        setStage(S.arrived);
+        toast.success("🎯 Your driver has arrived!");
+      }
+      if (type === "ride_completed") {
+        setStage(S.completed);
+      }
+      if (type === "no_candidates") {
+        toast.error("No drivers available. Please try again.");
+        reset();
+      }
+    });
+
     return () => {
       u.forEach((f) => f());
       riderWS.disconnect();
+      stopLocation();
     };
   }, []);
+
+  // Network reconnect
+  useEffect(() => {
+    if (Capacitor.isNativePlatform()) {
+      Network.addListener("networkStatusChange", (s) => {
+        if (s.connected) {
+          riderWS.connect("/ws/rider");
+          startLocation();
+        }
+      });
+      return () => Network.removeAllListeners();
+    }
+    const onOnline = () => {
+      riderWS.connect("/ws/rider");
+      startLocation();
+    };
+    window.addEventListener("online", onOnline);
+    return () => window.removeEventListener("online", onOnline);
+  }, []);
+
+  // GPS — send rider_location_update via WS
+  const startLocation = useCallback(async () => {
+    if (Capacitor.isNativePlatform()) {
+      if (bgRunning.current) return;
+      bgRunning.current = true;
+      await BackgroundGeolocation.start(
+        {
+          backgroundMessage: "Drivo is sharing your location with your driver.",
+          backgroundTitle: "Drivo — Live",
+          requestPermissions: true,
+          stale: false,
+          distanceFilter: 15,
+        },
+        (location, error) => {
+          if (error || !location) {
+            bgRunning.current = false;
+            return;
+          }
+          const loc = { lat: location.latitude, lng: location.longitude };
+          setRiderLoc(loc);
+          if (riderWS.isConnected()) {
+            riderWS.send("rider_location_update", {
+              latitude: loc.lat,
+              longitude: loc.lng,
+            });
+          }
+        },
+      );
+    } else {
+      if (!navigator.geolocation || watchId.current) return;
+      watchId.current = navigator.geolocation.watchPosition(
+        (pos) => {
+          const loc = { lat: pos.coords.latitude, lng: pos.coords.longitude };
+          setRiderLoc(loc);
+          if (riderWS.isConnected()) {
+            riderWS.send("rider_location_update", {
+              latitude: loc.lat,
+              longitude: loc.lng,
+            });
+          }
+        },
+        () => {},
+        { enableHighAccuracy: true, timeout: 10000, maximumAge: 5000 },
+      );
+    }
+  }, []);
+
+  const stopLocation = useCallback(async () => {
+    if (Capacitor.isNativePlatform()) {
+      try {
+        await BackgroundGeolocation.stop();
+        bgRunning.current = false;
+      } catch {}
+    } else {
+      if (watchId.current != null) {
+        navigator.geolocation.clearWatch(watchId.current);
+        watchId.current = null;
+      }
+    }
+  }, []);
+
+  // Start location when WS connects
+  useEffect(() => {
+    if (wsOk) startLocation();
+  }, [wsOk, startLocation]);
+
+  // Pool check
+  useEffect(() => {
+    if (!pickup?.lat || !dropoff?.lat) {
+      setPoolCheck(null);
+      return;
+    }
+    setCheckingPool(true);
+    const t = setTimeout(async () => {
+      try {
+        const r = await rideAPI.checkPool({
+          pickup_lat: pickup.lat,
+          pickup_lng: pickup.lng,
+          dropoff_lat: dropoff.lat,
+          dropoff_lng: dropoff.lng,
+        });
+        setPoolCheck(r.data);
+      } catch {
+        setPoolCheck(null);
+      }
+      setCheckingPool(false);
+    }, 500);
+    return () => {
+      clearTimeout(t);
+      setCheckingPool(false);
+    };
+  }, [pickup, dropoff]);
 
   const reset = () => {
     setStage(S.idle);
@@ -162,6 +355,12 @@ export default function Rider() {
     setDriverInfo(null);
     setDriverLoc(null);
     setCancelling(false);
+    setPoolCheck(null);
+    setRideMode("solo");
+    setScheduledAt(null);
+    setChatActive(false);
+    setRouteInfo(null);
+    setJoinedPoolInfo(null);
     [
       "drivo_rider_stage",
       "drivo_rider_ride",
@@ -182,17 +381,51 @@ export default function Rider() {
   }, [panel]);
 
   const requestRide = async () => {
-    if (!pickup || !dropoff) return;
+    if (!pickup?.lat || !dropoff?.lat) return;
+    if (scheduledAt) {
+      try {
+        await rideAPI.request({
+          pickup_lat: pickup.lat,
+          pickup_lng: pickup.lng,
+          dropoff_lat: dropoff.lat,
+          dropoff_lng: dropoff.lng,
+          pickup_address: pickup.address || "Pickup",
+          dropoff_address: dropoff.address || "Dropoff",
+          scheduled_at: scheduledAt,
+        });
+        toast.success(
+          `✅ Scheduled for ${new Date(scheduledAt).toLocaleString("en-NG", { weekday: "short", hour: "2-digit", minute: "2-digit" })}`,
+        );
+        reset();
+      } catch (e) {
+        toast.error(e.response?.data?.error || "Scheduling failed");
+      }
+      return;
+    }
     setStage(S.searching);
     try {
-      const res = await rideAPI.request({
+      const body = {
         pickup_lat: pickup.lat,
         pickup_lng: pickup.lng,
         dropoff_lat: dropoff.lat,
         dropoff_lng: dropoff.lng,
-        pickup_address: pickup.address || "Selected location",
-        dropoff_address: dropoff.address || "Selected location",
-      });
+        pickup_address: pickup.address || "Pickup",
+        dropoff_address: dropoff.address || "Dropoff",
+      };
+      if (rideMode === "pool" && poolCheck?.has_pool && poolCheck?.pool?.id) {
+        const r = await rideAPI.joinPool({
+          pool_id: poolCheck.pool.id,
+          ...body,
+        });
+        if (stageRef.current === S.searching) {
+          setRide(r.data.ride);
+          setJoinedPoolInfo(poolCheck?.pool || null);
+          setStage(S.accepted);
+          toast.success("🚌 Joined pool ride!");
+        }
+        return;
+      }
+      const res = await rideAPI.request(body);
       if (stageRef.current === S.searching) setRide(res.data);
     } catch (e) {
       if (stageRef.current === S.searching) {
@@ -204,8 +437,8 @@ export default function Rider() {
 
   const cancelRide = async () => {
     if (cancelling) return;
-    const currentRide = ride || rideRef.current;
-    const rideId = currentRide?.ride_id || currentRide?.ID || currentRide?.id;
+    const rideId =
+      ride?.ride_id || ride?.ID || ride?.id || rideRef.current?.ride_id;
     if (!rideId) {
       reset();
       toast("Search cancelled");
@@ -239,7 +472,7 @@ export default function Rider() {
         score: rating,
         comment,
       });
-      toast.success("Thanks for rating! ⭐");
+      toast.success("Thanks! ⭐");
       setRatingOpen(false);
       reset();
       setRating(0);
@@ -250,55 +483,63 @@ export default function Rider() {
   };
 
   const fmt = (f) => (f ? `₦${Number(f).toLocaleString()}` : "—");
-
-  const sidebarProps = {
-    user,
-    panel,
-    setPanel,
-    isDark,
-    toggle,
-    wsOk,
-    logout,
-    stage,
-    ride,
-    driverInfo,
-    history,
-    pickup,
-    dropoff,
-    setPickup,
-    setDropoff,
-    reset,
-    requestRide,
-    cancelRide,
-    fmt,
-    setRatingOpen,
-  };
+  const isActiveRide = [S.accepted, S.arrived, S.ongoing].includes(stage);
+  const rideId = ride?.ride_id || ride?.ID || ride?.id;
 
   return (
     <div
-      className={`flex h-screen w-screen overflow-hidden ${isDark ? "bg-zinc-950" : "bg-zinc-50"} font-sans`}
+      className={`flex h-screen w-screen overflow-hidden ${isDark ? "bg-[#0a0a0f]" : "bg-slate-50"} font-sans`}
     >
-      {/* Mobile sidebar overlay */}
+      {/* Mobile sidebar */}
       <AnimatePresence>
         {sideOpen && (
           <>
             <motion.div
-              className="fixed inset-0 bg-black/40 z-30 lg:hidden"
+              className="fixed inset-0 bg-black/60 backdrop-blur-sm z-30 lg:hidden"
               onClick={() => setSideOpen(false)}
               initial={{ opacity: 0 }}
               animate={{ opacity: 1 }}
               exit={{ opacity: 0 }}
             />
             <motion.div
-              className="fixed left-0 top-0 bottom-0 w-[320px] bg-white dark:bg-zinc-900 z-40 lg:hidden shadow-float flex flex-col"
-              initial={{ x: -320 }}
+              className="fixed left-0 top-0 bottom-0 w-[340px] z-40 lg:hidden flex flex-col"
+              style={{ background: isDark ? "#0f0f18" : "#fff" }}
+              initial={{ x: -340 }}
               animate={{ x: 0 }}
-              exit={{ x: -320 }}
-              transition={{ type: "spring", damping: 30, stiffness: 300 }}
+              exit={{ x: -340 }}
+              transition={{ type: "spring", damping: 28, stiffness: 280 }}
             >
               <SidebarContent
-                {...sidebarProps}
-                onClose={() => setSideOpen(false)}
+                user={user}
+                panel={panel}
+                setPanel={setPanel}
+                isDark={isDark}
+                toggle={toggle}
+                wsOk={wsOk}
+                logout={logout}
+                stage={stage}
+                ride={ride}
+                driverInfo={driverInfo}
+                history={history}
+                pickup={pickup}
+                dropoff={dropoff}
+                setPickup={setPickup}
+                setDropoff={setDropoff}
+                reset={reset}
+                requestRide={requestRide}
+                cancelRide={cancelRide}
+                fmt={fmt}
+                setRatingOpen={setRatingOpen}
+                rideMode={rideMode}
+                setRideMode={setRideMode}
+                poolCheck={poolCheck}
+                checkingPool={checkingPool}
+                scheduledAt={scheduledAt}
+                setScheduledAt={setScheduledAt}
+                routeInfo={routeInfo}
+                joinedPoolInfo={joinedPoolInfo}
+                onSchedule={() => setScheduleOpen(true)}
+                onRecurring={() => setRecurringOpen(true)}
               />
             </motion.div>
           </>
@@ -306,8 +547,45 @@ export default function Rider() {
       </AnimatePresence>
 
       {/* Desktop sidebar */}
-      <div className="hidden lg:flex w-[380px] flex-shrink-0 flex-col bg-white dark:bg-zinc-900 border-r border-zinc-100 dark:border-zinc-800 z-10">
-        <SidebarContent {...sidebarProps} />
+      <div
+        className="hidden lg:flex w-[390px] flex-shrink-0 flex-col border-r z-10"
+        style={{
+          background: isDark ? "#0f0f18" : "#fff",
+          borderColor: isDark ? "rgba(255,255,255,.06)" : "rgba(0,0,0,.07)",
+        }}
+      >
+        <SidebarContent
+          user={user}
+          panel={panel}
+          setPanel={setPanel}
+          isDark={isDark}
+          toggle={toggle}
+          wsOk={wsOk}
+          logout={logout}
+          stage={stage}
+          ride={ride}
+          driverInfo={driverInfo}
+          history={history}
+          pickup={pickup}
+          dropoff={dropoff}
+          setPickup={setPickup}
+          setDropoff={setDropoff}
+          reset={reset}
+          requestRide={requestRide}
+          cancelRide={cancelRide}
+          fmt={fmt}
+          setRatingOpen={setRatingOpen}
+          rideMode={rideMode}
+          setRideMode={setRideMode}
+          poolCheck={poolCheck}
+          checkingPool={checkingPool}
+          scheduledAt={scheduledAt}
+          setScheduledAt={setScheduledAt}
+          routeInfo={routeInfo}
+          joinedPoolInfo={joinedPoolInfo}
+          onSchedule={() => setScheduleOpen(true)}
+          onRecurring={() => setRecurringOpen(true)}
+        />
       </div>
 
       {/* Map */}
@@ -316,37 +594,87 @@ export default function Rider() {
           pickupLoc={pickup}
           dropoffLoc={dropoff}
           driverLoc={driverLoc}
+          riderLoc={riderLoc}
+          stage={stage}
+          onRouteCalculated={(d, t) =>
+            setRouteInfo({ distKm: d, durationMin: t })
+          }
         />
 
-        {/* ← Top bar — NO pointer-events-none on parent div */}
-        <div className="absolute top-0 left-0 right-0 flex items-center justify-between p-4">
+        {/* Top bar */}
+        <div className="absolute top-0 left-0 right-0 flex items-center justify-between p-4 pointer-events-none">
           <button
             onClick={() => setSideOpen(true)}
-            className="lg:hidden w-11 h-11 glass-light dark:glass-dark rounded-2xl flex items-center justify-center shadow-card text-zinc-700 dark:text-zinc-200 active:scale-95 transition-all"
+            className="lg:hidden pointer-events-auto w-11 h-11 rounded-2xl flex items-center justify-center shadow-lg border border-white/20 text-zinc-700 dark:text-zinc-100 active:scale-95 transition-all"
+            style={{
+              background: isDark
+                ? "rgba(15,15,24,.85)"
+                : "rgba(255,255,255,.85)",
+              backdropFilter: "blur(20px)",
+            }}
           >
             <Menu size={20} />
           </button>
-          <div className="ml-auto">
+          <div className="ml-auto pointer-events-auto flex items-center gap-2">
             <div
-              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-semibold glass-light dark:glass-dark shadow-sm ${wsOk ? "text-brand" : "text-red-500"}`}
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-bold border border-white/20 ${wsOk ? "text-brand" : "text-red-400"}`}
+              style={{
+                background: isDark
+                  ? "rgba(15,15,24,.85)"
+                  : "rgba(255,255,255,.85)",
+                backdropFilter: "blur(20px)",
+              }}
             >
-              {wsOk ? <Wifi size={12} /> : <WifiOff size={12} />}
+              {wsOk ? <Wifi size={11} /> : <WifiOff size={11} />}
               {wsOk ? "Live" : "Offline"}
             </div>
           </div>
         </div>
 
-        {/* Mobile bottom sheet — active ride states */}
+        {/* Chat */}
+        <AnimatePresence>
+          {isActiveRide && ride?.ride_mode !== "pool" && rideId && (
+            <motion.div
+              className="absolute bottom-24 right-4"
+              initial={{ opacity: 0, scale: 0.8 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.8 }}
+            >
+              <ChatBox
+                rideId={rideId}
+                senderType="rider"
+                ws={riderWS}
+                otherName={driverInfo?.driver_name}
+                isActive={chatActive}
+              />
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        {/* Mobile bottom sheet */}
         <AnimatePresence>
           {[S.accepted, S.arrived, S.ongoing, S.completed].includes(stage) && (
             <motion.div
-              className="absolute bottom-0 left-0 right-0 lg:hidden glass-light dark:glass-dark rounded-t-3xl p-5 safe-bottom shadow-panel z-10"
+              className="absolute bottom-0 left-0 right-0 lg:hidden rounded-t-3xl p-5 safe-bottom z-10 border-t border-white/10"
+              style={{
+                background: isDark
+                  ? "rgba(15,15,24,.95)"
+                  : "rgba(255,255,255,.97)",
+                backdropFilter: "blur(24px)",
+              }}
               initial={{ y: 300 }}
               animate={{ y: 0 }}
               exit={{ y: 300 }}
               transition={{ type: "spring", damping: 28, stiffness: 300 }}
             >
-              <div className="w-10 h-1 bg-zinc-300 dark:bg-zinc-600 rounded-full mx-auto mb-4" />
+              <div
+                className="w-10 h-1 rounded-full mx-auto mb-4"
+                style={{
+                  background: isDark
+                    ? "rgba(255,255,255,.2)"
+                    : "rgba(0,0,0,.15)",
+                }}
+              />
               <MobileStatus
                 stage={stage}
                 ride={ride}
@@ -361,7 +689,7 @@ export default function Rider() {
         </AnimatePresence>
       </div>
 
-      {/* Rating Modal */}
+      {/* Rating modal */}
       <Modal
         open={ratingOpen}
         onClose={() => setRatingOpen(false)}
@@ -369,12 +697,19 @@ export default function Rider() {
       >
         <div className="flex flex-col gap-5">
           {driverInfo && (
-            <div className="flex items-center gap-3 p-4 bg-zinc-50 dark:bg-zinc-800 rounded-2xl">
-              <div className="w-12 h-12 bg-brand/10 rounded-full flex items-center justify-center text-2xl font-black text-brand font-display">
-                {driverInfo.driver_name?.[0]?.toUpperCase()}
+            <div
+              className="flex items-center gap-3 p-4 rounded-2xl"
+              style={{
+                background: isDark
+                  ? "rgba(255,255,255,.05)"
+                  : "rgba(0,0,0,.04)",
+              }}
+            >
+              <div className="w-14 h-14 bg-brand/10 rounded-2xl flex items-center justify-center text-2xl font-black text-brand font-display">
+                {driverInfo.driver_name?.[0]}
               </div>
               <div>
-                <p className="font-semibold text-zinc-900 dark:text-white">
+                <p className="font-bold text-zinc-900 dark:text-white">
                   {driverInfo.driver_name}
                 </p>
                 <p className="text-sm text-zinc-500">
@@ -392,7 +727,11 @@ export default function Rider() {
             </div>
           </div>
           <textarea
-            className="w-full p-4 rounded-2xl bg-zinc-100 dark:bg-zinc-800 text-sm text-zinc-900 dark:text-white placeholder-zinc-400 focus:outline-none focus:ring-2 focus:ring-brand resize-none border-2 border-transparent focus:border-brand transition-all"
+            className="w-full p-4 rounded-2xl text-sm placeholder-zinc-400 focus:outline-none resize-none border-2 border-transparent focus:border-brand transition-all"
+            style={{
+              background: isDark ? "rgba(255,255,255,.06)" : "rgba(0,0,0,.04)",
+              color: isDark ? "#fff" : "#000",
+            }}
             rows={3}
             placeholder="Leave a comment (optional)..."
             value={comment}
@@ -415,9 +754,29 @@ export default function Rider() {
           </div>
         </div>
       </Modal>
+
+      <ScheduleModal
+        open={scheduleOpen}
+        onClose={() => setScheduleOpen(false)}
+        onConfirm={(iso) => {
+          setScheduledAt(iso);
+          toast(
+            `📅 ${new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`,
+            { icon: "⏰" },
+          );
+        }}
+      />
+      <RecurringModal
+        open={recurringOpen}
+        onClose={() => setRecurringOpen(false)}
+        pickup={pickup}
+        dropoff={dropoff}
+      />
     </div>
   );
 }
+
+// ── Sidebar ────────────────────────────────────────────────────────────────────
 
 function SidebarContent({
   user,
@@ -440,55 +799,138 @@ function SidebarContent({
   cancelRide,
   fmt,
   setRatingOpen,
-  onClose,
+  rideMode,
+  setRideMode,
+  poolCheck,
+  checkingPool,
+  scheduledAt,
+  setScheduledAt,
+  routeInfo,
+  joinedPoolInfo,
+  onSchedule,
+  onRecurring,
 }) {
+  const isIdle = [S.idle, S.searching].includes(stage);
+  const borderColor = isDark ? "rgba(255,255,255,.07)" : "rgba(0,0,0,.07)";
+  const mutedBg = isDark ? "rgba(255,255,255,.04)" : "rgba(0,0,0,.03)";
+
   return (
-    <>
-      <div className="p-5 flex items-center justify-between flex-shrink-0 border-b border-zinc-100 dark:border-zinc-800">
-        <h1 className="text-2xl font-black text-zinc-900 dark:text-white font-display">
-          Driv<span className="text-brand">o</span>
-        </h1>
+    <div className="flex flex-col h-full">
+      {/* Header */}
+      <div
+        className="px-5 pt-6 pb-4 flex items-center justify-between flex-shrink-0"
+        style={{ borderBottom: `1px solid ${borderColor}` }}
+      >
+        <div>
+          <div className="flex items-center gap-2">
+            <div className="w-8 h-8 bg-brand rounded-xl flex items-center justify-center">
+              <Zap size={16} className="text-black" fill="black" />
+            </div>
+            <h1
+              className="text-xl font-black tracking-tight"
+              style={{ color: isDark ? "#fff" : "#0a0a0f" }}
+            >
+              driv<span className="text-brand">o</span>
+            </h1>
+          </div>
+          <p
+            className="text-[11px] font-medium mt-0.5 ml-10"
+            style={{
+              color: isDark ? "rgba(255,255,255,.4)" : "rgba(0,0,0,.4)",
+            }}
+          >
+            Rider dashboard
+          </p>
+        </div>
         <div className="flex items-center gap-2">
           <button
             onClick={toggle}
-            className="w-9 h-9 rounded-xl bg-zinc-100 dark:bg-zinc-800 flex items-center justify-center text-base"
+            className="w-9 h-9 rounded-xl flex items-center justify-center text-base transition-all active:scale-95"
+            style={{ background: mutedBg }}
           >
             {isDark ? "☀️" : "🌙"}
           </button>
           <div
-            className={`w-2 h-2 rounded-full ${wsOk ? "bg-brand" : "bg-red-400"}`}
+            className={`w-2.5 h-2.5 rounded-full ${wsOk ? "bg-brand" : "bg-red-400"}`}
+            style={{ boxShadow: wsOk ? "0 0 6px rgba(0,200,83,.6)" : "none" }}
           />
         </div>
       </div>
 
-      <div className="flex p-2 gap-1 border-b border-zinc-100 dark:border-zinc-800 flex-shrink-0">
+      {/* Greeting */}
+      {isIdle && (
+        <div
+          className="px-5 py-4 flex-shrink-0"
+          style={{ borderBottom: `1px solid ${borderColor}` }}
+        >
+          <p
+            className="text-xs font-semibold"
+            style={{
+              color: isDark ? "rgba(255,255,255,.35)" : "rgba(0,0,0,.35)",
+            }}
+          >
+            Good{" "}
+            {new Date().getHours() < 12
+              ? "morning"
+              : new Date().getHours() < 18
+                ? "afternoon"
+                : "evening"}{" "}
+            👋
+          </p>
+          <p
+            className="font-bold text-base mt-0.5 truncate"
+            style={{ color: isDark ? "#fff" : "#0a0a0f" }}
+          >
+            {user?.Name}
+          </p>
+        </div>
+      )}
+
+      {/* Tabs */}
+      <div
+        className="flex px-3 pt-2 gap-1 flex-shrink-0"
+        style={{ borderBottom: `1px solid ${borderColor}` }}
+      >
         {[
-          { k: "ride", label: "Ride", icon: "🚗" },
-          { k: "history", label: "History", icon: "📋" },
-          { k: "profile", label: "Profile", icon: "👤" },
-        ].map(({ k, label, icon }) => (
+          { k: "ride", icon: "🚗", label: "Ride" },
+          { k: "history", icon: "📋", label: "History" },
+          { k: "profile", icon: "👤", label: "Profile" },
+        ].map(({ k, icon, label }) => (
           <button
             key={k}
             onClick={() => setPanel(k)}
-            className={`flex-1 flex items-center justify-center gap-1.5 py-2.5 rounded-xl text-xs font-semibold transition-all ${panel === k ? "bg-brand text-white shadow-brand" : "text-zinc-500 hover:bg-zinc-100 dark:hover:bg-zinc-800 hover:text-zinc-900 dark:hover:text-white"}`}
+            className={`flex-1 flex items-center justify-center gap-1.5 py-2.5 rounded-xl text-xs font-bold transition-all mb-2 ${panel === k ? "bg-brand text-black" : "text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-200"}`}
+            style={panel === k ? {} : { background: "transparent" }}
           >
-            <span>{icon}</span>
+            <span className="text-sm">{icon}</span>
             {label}
           </button>
         ))}
       </div>
 
-      <div className="flex-1 overflow-y-auto scrollbar-hide p-4 space-y-3">
+      <div className="flex-1 overflow-y-auto scrollbar-hide px-4 py-4 space-y-3">
         {panel === "ride" &&
-          ([S.idle, S.searching].includes(stage) ? (
-            <LocationSearch
-              onPickup={setPickup}
-              onDropoff={setDropoff}
-              onRequest={requestRide}
+          (isIdle ? (
+            <BookingPanel
+              pickup={pickup}
+              dropoff={dropoff}
+              setPickup={setPickup}
+              setDropoff={setDropoff}
+              rideMode={rideMode}
+              setRideMode={setRideMode}
+              poolCheck={poolCheck}
+              checkingPool={checkingPool}
+              scheduledAt={scheduledAt}
+              setScheduledAt={setScheduledAt}
+              routeInfo={routeInfo}
+              onSchedule={onSchedule}
+              onRecurring={onRecurring}
+              requestRide={requestRide}
+              cancelRide={cancelRide}
               stage={stage}
               ride={ride}
               fmt={fmt}
-              cancelRide={cancelRide}
+              isDark={isDark}
             />
           ) : (
             <ActiveRidePanel
@@ -499,14 +941,399 @@ function SidebarContent({
               fmt={fmt}
               setRatingOpen={setRatingOpen}
               reset={reset}
+              joinedPoolInfo={joinedPoolInfo}
+              isDark={isDark}
             />
           ))}
-        {panel === "history" && <HistoryPanel history={history} fmt={fmt} />}
-        {panel === "profile" && <ProfilePanel user={user} logout={logout} />}
+        {panel === "history" && (
+          <HistoryPanel history={history} fmt={fmt} isDark={isDark} />
+        )}
+        {panel === "profile" && (
+          <ProfilePanel user={user} logout={logout} isDark={isDark} />
+        )}
       </div>
-    </>
+    </div>
   );
 }
+
+// ── Booking panel ──────────────────────────────────────────────────────────────
+
+function BookingPanel({
+  pickup,
+  dropoff,
+  setPickup,
+  setDropoff,
+  rideMode,
+  setRideMode,
+  poolCheck,
+  checkingPool,
+  scheduledAt,
+  setScheduledAt,
+  routeInfo,
+  onSchedule,
+  onRecurring,
+  requestRide,
+  cancelRide,
+  stage,
+  ride,
+  fmt,
+  isDark,
+}) {
+  const canRequest = pickup?.lat && dropoff?.lat;
+  const isSearching = stage === "searching";
+  const mutedBg = isDark ? "rgba(255,255,255,.05)" : "rgba(0,0,0,.04)";
+  const cardBorder = isDark ? "rgba(255,255,255,.08)" : "rgba(0,0,0,.08)";
+
+  if (isSearching)
+    return (
+      <motion.div
+        className="space-y-4"
+        initial={{ opacity: 0 }}
+        animate={{ opacity: 1 }}
+      >
+        <div
+          className="rounded-3xl p-8 text-center border"
+          style={{ background: mutedBg, borderColor: cardBorder }}
+        >
+          <div className="relative w-20 h-20 mx-auto mb-5">
+            <div className="absolute inset-0 border-4 border-brand/20 rounded-full" />
+            <div className="absolute inset-0 border-4 border-transparent border-t-brand rounded-full animate-spin" />
+            <span className="absolute inset-0 flex items-center justify-center text-3xl">
+              🔍
+            </span>
+          </div>
+          <p
+            className="font-black text-xl tracking-tight"
+            style={{ color: isDark ? "#fff" : "#0a0a0f" }}
+          >
+            Finding your driver
+          </p>
+          <p
+            className="text-sm mt-1.5"
+            style={{
+              color: isDark ? "rgba(255,255,255,.4)" : "rgba(0,0,0,.4)",
+            }}
+          >
+            Matching with nearby drivers...
+          </p>
+          {ride && (
+            <p className="text-brand font-black text-4xl mt-4 font-display">
+              {fmt(ride.estimated_fare)}
+            </p>
+          )}
+          {routeInfo && (
+            <p
+              className="text-xs mt-1.5"
+              style={{
+                color: isDark ? "rgba(255,255,255,.35)" : "rgba(0,0,0,.35)",
+              }}
+            >
+              {routeInfo.distKm?.toFixed(1)}km · ~{routeInfo.durationMin}min
+            </p>
+          )}
+        </div>
+        <button
+          onClick={cancelRide}
+          className="w-full py-3.5 rounded-2xl text-sm font-bold text-red-400 border border-red-500/20 active:scale-[0.98] transition-all"
+          style={{
+            background: isDark ? "rgba(239,68,68,.08)" : "rgba(239,68,68,.06)",
+          }}
+        >
+          Cancel Search
+        </button>
+      </motion.div>
+    );
+
+  return (
+    <div className="space-y-3">
+      {/* Schedule banner */}
+      <AnimatePresence>
+        {scheduledAt && (
+          <motion.div
+            className="flex items-center gap-2.5 px-3.5 py-2.5 rounded-2xl border border-brand/25"
+            style={{ background: "rgba(0,200,83,.08)" }}
+            initial={{ opacity: 0, y: -6 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0 }}
+          >
+            <Clock size={13} className="text-brand flex-shrink-0" />
+            <p className="text-xs font-semibold text-brand flex-1 truncate">
+              {new Date(scheduledAt).toLocaleString("en-NG", {
+                weekday: "short",
+                month: "short",
+                day: "numeric",
+                hour: "2-digit",
+                minute: "2-digit",
+              })}
+            </p>
+            <button
+              onClick={() => setScheduledAt(null)}
+              className="text-brand/50 hover:text-red-400 transition-colors"
+            >
+              <X size={13} />
+            </button>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      <LocationSearch
+        onPickup={setPickup}
+        onDropoff={setDropoff}
+        onRequest={requestRide}
+        stage={stage}
+        ride={ride}
+        fmt={fmt}
+        cancelRide={cancelRide}
+      />
+
+      <AnimatePresence>
+        {canRequest && (
+          <motion.div
+            className="space-y-3"
+            initial={{ opacity: 0, y: 8 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0 }}
+          >
+            {/* Route info */}
+            {routeInfo && (
+              <div
+                className="flex items-center gap-2 px-3.5 py-2.5 rounded-xl border"
+                style={{ background: mutedBg, borderColor: cardBorder }}
+              >
+                <span className="font-black text-sm text-brand">
+                  {routeInfo.distKm < 1
+                    ? `${Math.round(routeInfo.distKm * 1000)}m`
+                    : `${routeInfo.distKm.toFixed(1)}km`}
+                </span>
+                <span className="w-1 h-1 rounded-full bg-zinc-400" />
+                <span
+                  className="text-xs"
+                  style={{
+                    color: isDark ? "rgba(255,255,255,.4)" : "rgba(0,0,0,.4)",
+                  }}
+                >
+                  ~{routeInfo.durationMin} min
+                </span>
+                <span className="w-1 h-1 rounded-full bg-zinc-400" />
+                <span className="text-xs font-bold text-brand">
+                  ~
+                  {fmt(
+                    Math.round(
+                      (500 +
+                        routeInfo.distKm * 150 +
+                        routeInfo.durationMin * 20) /
+                        50,
+                    ) * 50,
+                  )}
+                </span>
+              </div>
+            )}
+
+            {/* Solo / Pool */}
+            <div className="grid grid-cols-2 gap-2">
+              {[
+                {
+                  mode: "solo",
+                  icon: "🚀",
+                  label: "Solo",
+                  sub: "Just you",
+                  extra: null,
+                },
+                {
+                  mode: "pool",
+                  icon: "🚌",
+                  label: "Pool",
+                  sub: "Share & save",
+                  extra: poolCheck?.has_pool
+                    ? `${poolCheck.riders_in_pool} riding`
+                    : null,
+                },
+              ].map(({ mode, icon, label, sub, extra }) => (
+                <button
+                  key={mode}
+                  onClick={() => setRideMode(mode)}
+                  className="relative p-4 rounded-2xl border-2 text-left transition-all active:scale-[0.97]"
+                  style={{
+                    borderColor: rideMode === mode ? "#00C853" : cardBorder,
+                    background:
+                      rideMode === mode ? "rgba(0,200,83,.08)" : mutedBg,
+                  }}
+                >
+                  {extra && (
+                    <span className="absolute -top-2 -right-2 bg-brand text-black text-[9px] font-black px-1.5 py-0.5 rounded-full">
+                      {extra}
+                    </span>
+                  )}
+                  {checkingPool && mode === "pool" && (
+                    <div className="absolute top-2 right-2 w-3 h-3 border border-brand/30 border-t-brand rounded-full animate-spin" />
+                  )}
+                  <span className="text-xl">{icon}</span>
+                  <p
+                    className="font-black text-sm mt-1.5"
+                    style={{ color: isDark ? "#fff" : "#0a0a0f" }}
+                  >
+                    {label}
+                  </p>
+                  <p
+                    className="text-[11px] mt-0.5"
+                    style={{
+                      color: isDark
+                        ? "rgba(255,255,255,.35)"
+                        : "rgba(0,0,0,.4)",
+                    }}
+                  >
+                    {sub}
+                  </p>
+                  {mode === "pool" && poolCheck?.has_pool && (
+                    <p className="text-xs font-bold text-brand mt-1.5">
+                      {fmt(poolCheck.estimated_fare)}
+                    </p>
+                  )}
+                </button>
+              ))}
+            </div>
+
+            {/* Pool info */}
+            <AnimatePresence>
+              {rideMode === "pool" && poolCheck && (
+                <motion.div
+                  className="px-3.5 py-2.5 rounded-xl text-xs border"
+                  style={{
+                    background: poolCheck.has_pool
+                      ? "rgba(0,200,83,.07)"
+                      : mutedBg,
+                    borderColor: poolCheck.has_pool
+                      ? "rgba(0,200,83,.25)"
+                      : cardBorder,
+                  }}
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1 }}
+                  exit={{ opacity: 0 }}
+                >
+                  {poolCheck.has_pool ? (
+                    <span
+                      style={{
+                        color: isDark
+                          ? "rgba(255,255,255,.7)"
+                          : "rgba(0,0,0,.65)",
+                      }}
+                    >
+                      🎉 Pool available — {poolCheck.riders_in_pool} rider
+                      {poolCheck.riders_in_pool > 1 ? "s" : ""} going your way ·
+                      save{" "}
+                      <span className="font-bold text-brand">
+                        {fmt(poolCheck.savings)}
+                      </span>
+                    </span>
+                  ) : (
+                    <span
+                      style={{
+                        color: isDark
+                          ? "rgba(255,255,255,.4)"
+                          : "rgba(0,0,0,.4)",
+                      }}
+                    >
+                      🌱 No pool yet nearby — fare drops as riders join
+                    </span>
+                  )}
+                </motion.div>
+              )}
+            </AnimatePresence>
+
+            {/* Schedule + Recurring */}
+            <div className="grid grid-cols-2 gap-2">
+              {[
+                {
+                  label: "Schedule",
+                  sublabel: scheduledAt
+                    ? new Date(scheduledAt).toLocaleTimeString([], {
+                        hour: "2-digit",
+                        minute: "2-digit",
+                      })
+                    : "Book ahead",
+                  icon: <Clock size={14} />,
+                  active: !!scheduledAt,
+                  onClick: onSchedule,
+                },
+                {
+                  label: "Recurring",
+                  sublabel: "Auto-book daily",
+                  icon: <RefreshCw size={14} />,
+                  active: false,
+                  onClick: onRecurring,
+                },
+              ].map(({ label, sublabel, icon, active, onClick }) => (
+                <button
+                  key={label}
+                  onClick={onClick}
+                  className="flex items-center gap-2.5 px-3 py-3 rounded-2xl border text-left transition-all active:scale-[0.97]"
+                  style={{
+                    borderColor: active ? "#00C853" : cardBorder,
+                    background: active ? "rgba(0,200,83,.08)" : mutedBg,
+                  }}
+                >
+                  <div
+                    className={`w-7 h-7 rounded-xl flex items-center justify-center flex-shrink-0 ${active ? "bg-brand text-black" : "text-zinc-400"}`}
+                    style={
+                      active
+                        ? {}
+                        : {
+                            background: isDark
+                              ? "rgba(255,255,255,.08)"
+                              : "rgba(0,0,0,.06)",
+                          }
+                    }
+                  >
+                    {icon}
+                  </div>
+                  <div className="min-w-0">
+                    <p
+                      className="text-xs font-bold truncate"
+                      style={{ color: isDark ? "#fff" : "#0a0a0f" }}
+                    >
+                      {label}
+                    </p>
+                    <p
+                      className="text-[10px] truncate"
+                      style={{
+                        color: isDark
+                          ? "rgba(255,255,255,.35)"
+                          : "rgba(0,0,0,.4)",
+                      }}
+                    >
+                      {sublabel}
+                    </p>
+                  </div>
+                </button>
+              ))}
+            </div>
+
+            {/* CTA */}
+            <button
+              onClick={requestRide}
+              className="w-full py-4 rounded-2xl font-black text-sm tracking-wide flex items-center justify-center gap-2.5 active:scale-[0.98] transition-all"
+              style={{
+                background: "linear-gradient(135deg,#00C853,#00A843)",
+                color: "#000",
+                boxShadow: "0 4px 20px rgba(0,200,83,.4)",
+              }}
+            >
+              <Navigation size={16} />
+              {scheduledAt
+                ? "Schedule Ride"
+                : rideMode === "pool" && poolCheck?.has_pool
+                  ? "Join Pool Ride"
+                  : "Request Ride"}
+              <ChevronRight size={16} className="ml-auto" />
+            </button>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
+  );
+}
+
+// ── Active ride panel ──────────────────────────────────────────────────────────
 
 function ActiveRidePanel({
   stage,
@@ -516,7 +1343,12 @@ function ActiveRidePanel({
   fmt,
   setRatingOpen,
   reset,
+  joinedPoolInfo,
+  isDark,
 }) {
+  const mutedBg = isDark ? "rgba(255,255,255,.05)" : "rgba(0,0,0,.03)";
+  const cardBorder = isDark ? "rgba(255,255,255,.08)" : "rgba(0,0,0,.07)";
+
   if (stage === S.accepted && driverInfo)
     return (
       <motion.div
@@ -524,52 +1356,139 @@ function ActiveRidePanel({
         initial={{ opacity: 0 }}
         animate={{ opacity: 1 }}
       >
-        <div className="bg-zinc-50 dark:bg-zinc-800 rounded-3xl p-5 space-y-4">
-          <div className="flex items-center gap-4">
+        {/* Driver card */}
+        <div
+          className="rounded-3xl p-5 border"
+          style={{ background: mutedBg, borderColor: cardBorder }}
+        >
+          <div className="flex items-center gap-3 mb-4">
             <div className="w-14 h-14 bg-brand/10 rounded-2xl flex items-center justify-center text-2xl font-black text-brand font-display flex-shrink-0">
               {driverInfo.driver_name?.[0]}
             </div>
             <div className="flex-1">
-              <p className="font-display font-bold text-zinc-900 dark:text-white">
+              <p
+                className="font-black text-base tracking-tight"
+                style={{ color: isDark ? "#fff" : "#0a0a0f" }}
+              >
                 {driverInfo.driver_name}
               </p>
-              <p className="text-sm text-zinc-500">{driverInfo.driver_phone}</p>
+              <p
+                className="text-xs mt-0.5"
+                style={{
+                  color: isDark ? "rgba(255,255,255,.4)" : "rgba(0,0,0,.4)",
+                }}
+              >
+                {driverInfo.driver_phone}
+              </p>
               <div className="flex items-center gap-1 mt-1">
-                <Star size={12} className="text-amber-400 fill-amber-400" />
-                <span className="text-sm font-semibold text-zinc-700 dark:text-zinc-300">
+                <Star size={11} className="text-amber-400 fill-amber-400" />
+                <span
+                  className="text-xs font-bold"
+                  style={{
+                    color: isDark ? "rgba(255,255,255,.7)" : "rgba(0,0,0,.7)",
+                  }}
+                >
                   {driverInfo.rating?.toFixed(1)}
                 </span>
               </div>
             </div>
-            <Badge color="green">ETA {driverInfo.eta_minutes}m</Badge>
-          </div>
-          <div className="bg-white dark:bg-zinc-700/50 rounded-2xl p-3 grid grid-cols-3 gap-2 text-xs">
-            <div>
-              <p className="text-zinc-400">Make</p>
-              <p className="font-semibold text-zinc-900 dark:text-white">
-                {driverInfo.vehicle_make || "—"}
-              </p>
-            </div>
-            <div>
-              <p className="text-zinc-400">Model</p>
-              <p className="font-semibold text-zinc-900 dark:text-white">
-                {driverInfo.vehicle_model || "—"}
-              </p>
-            </div>
-            <div>
-              <p className="text-zinc-400">Plate</p>
-              <p className="font-semibold text-zinc-900 dark:text-white">
-                {driverInfo.plate_number || "—"}
-              </p>
+            <div className="text-right">
+              <span className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-xl bg-brand/10 text-brand text-xs font-black">
+                ETA {driverInfo.eta_minutes}m
+              </span>
             </div>
           </div>
-          <p className="text-center text-xs text-zinc-400">
-            🚗 Driver is heading to your pickup
-          </p>
+          <div
+            className="grid grid-cols-3 gap-2 rounded-2xl p-3"
+            style={{
+              background: isDark ? "rgba(255,255,255,.04)" : "rgba(0,0,0,.04)",
+            }}
+          >
+            {[
+              ["Make", driverInfo.vehicle_make || "—"],
+              ["Model", driverInfo.vehicle_model || "—"],
+              ["Plate", driverInfo.plate_number || "—"],
+            ].map(([l, v]) => (
+              <div key={l}>
+                <p
+                  className="text-[10px]"
+                  style={{
+                    color: isDark ? "rgba(255,255,255,.35)" : "rgba(0,0,0,.4)",
+                  }}
+                >
+                  {l}
+                </p>
+                <p
+                  className="text-xs font-bold mt-0.5 truncate"
+                  style={{ color: isDark ? "#fff" : "#0a0a0f" }}
+                >
+                  {v}
+                </p>
+              </div>
+            ))}
+          </div>
         </div>
-        <Btn variant="danger" onClick={cancelRide}>
+
+        {/* Pool joined card */}
+        {joinedPoolInfo && ride?.ride_mode === "pool" && (
+          <div
+            className="rounded-2xl p-4 border border-brand/25"
+            style={{ background: "rgba(0,200,83,.07)" }}
+          >
+            <div className="flex items-center gap-2 mb-3">
+              <span className="text-lg">🚌</span>
+              <p
+                className="text-sm font-black"
+                style={{ color: isDark ? "#fff" : "#0a0a0f" }}
+              >
+                You're in a pool ride
+              </p>
+            </div>
+            <div className="grid grid-cols-3 gap-2 text-center">
+              {[
+                ["Your fare", fmt(ride?.estimated_fare)],
+                ["Riders", joinedPoolInfo.current_size || 1],
+                ["Max", joinedPoolInfo.max_riders || 3],
+              ].map(([l, v]) => (
+                <div
+                  key={l}
+                  className="rounded-xl p-2"
+                  style={{
+                    background: isDark
+                      ? "rgba(0,0,0,.25)"
+                      : "rgba(255,255,255,.7)",
+                  }}
+                >
+                  <p
+                    className="font-black text-sm"
+                    style={{ color: isDark ? "#fff" : "#0a0a0f" }}
+                  >
+                    {v}
+                  </p>
+                  <p
+                    className="text-[10px]"
+                    style={{
+                      color: isDark ? "rgba(255,255,255,.4)" : "rgba(0,0,0,.4)",
+                    }}
+                  >
+                    {l}
+                  </p>
+                </div>
+              ))}
+            </div>
+            <p className="text-[11px] text-center mt-2.5 text-brand">
+              Fare may drop as more riders join ↓
+            </p>
+          </div>
+        )}
+
+        <button
+          onClick={cancelRide}
+          className="w-full py-3.5 rounded-2xl text-sm font-bold text-red-400 border border-red-500/20 active:scale-[0.98] transition-all"
+          style={{ background: "rgba(239,68,68,.07)" }}
+        >
           Cancel Ride
-        </Btn>
+        </button>
       </motion.div>
     );
 
@@ -580,28 +1499,50 @@ function ActiveRidePanel({
         initial={{ opacity: 0 }}
         animate={{ opacity: 1 }}
       >
-        <div className="bg-brand/5 border-2 border-brand/20 rounded-3xl p-6 text-center">
+        <div
+          className="rounded-3xl p-7 text-center border border-brand/25"
+          style={{ background: "rgba(0,200,83,.07)" }}
+        >
           <motion.div
-            className="text-5xl mb-3"
-            animate={{ scale: [1, 1.15, 1] }}
+            className="text-6xl mb-4"
+            animate={{ scale: [1, 1.12, 1] }}
             transition={{ repeat: 3, duration: 0.5 }}
           >
             🎯
           </motion.div>
-          <p className="font-display font-bold text-xl text-zinc-900 dark:text-white">
+          <p
+            className="font-black text-xl tracking-tight"
+            style={{ color: isDark ? "#fff" : "#0a0a0f" }}
+          >
             Driver has arrived!
           </p>
-          <p className="text-sm text-zinc-500 mt-1">
+          <p
+            className="text-sm mt-1.5"
+            style={{
+              color: isDark ? "rgba(255,255,255,.45)" : "rgba(0,0,0,.45)",
+            }}
+          >
             Head to your pickup location
           </p>
           {driverInfo && (
-            <div className="mt-4 pt-4 border-t border-brand/20 text-xs text-zinc-500">
+            <div
+              className="mt-4 pt-4 border-t border-brand/20 text-xs"
+              style={{
+                color: isDark ? "rgba(255,255,255,.4)" : "rgba(0,0,0,.5)",
+              }}
+            >
               Look for{" "}
-              <span className="font-semibold text-zinc-900 dark:text-white">
+              <span
+                className="font-bold"
+                style={{ color: isDark ? "#fff" : "#0a0a0f" }}
+              >
                 {driverInfo.vehicle_color} {driverInfo.vehicle_make}
               </span>{" "}
               ·{" "}
-              <span className="font-semibold text-zinc-900 dark:text-white">
+              <span
+                className="font-bold"
+                style={{ color: isDark ? "#fff" : "#0a0a0f" }}
+              >
                 {driverInfo.plate_number}
               </span>
             </div>
@@ -617,23 +1558,47 @@ function ActiveRidePanel({
         initial={{ opacity: 0 }}
         animate={{ opacity: 1 }}
       >
-        <div className="bg-zinc-50 dark:bg-zinc-800 rounded-3xl p-6 text-center">
+        <div
+          className="rounded-3xl p-7 text-center border"
+          style={{
+            background: isDark ? "rgba(255,255,255,.04)" : "rgba(0,0,0,.03)",
+            borderColor: isDark ? "rgba(255,255,255,.07)" : "rgba(0,0,0,.07)",
+          }}
+        >
           <motion.div
-            className="text-5xl mb-3"
+            className="text-6xl mb-4"
             animate={{ x: [-4, 4, -4] }}
             transition={{ repeat: Infinity, duration: 0.8 }}
           >
             🚗
           </motion.div>
-          <p className="font-display font-bold text-xl text-zinc-900 dark:text-white">
+          <p
+            className="font-black text-xl tracking-tight"
+            style={{ color: isDark ? "#fff" : "#0a0a0f" }}
+          >
             Trip in progress
           </p>
-          <p className="text-sm text-zinc-500 mt-1">
+          <p
+            className="text-sm mt-1.5 mb-4"
+            style={{
+              color: isDark ? "rgba(255,255,255,.4)" : "rgba(0,0,0,.4)",
+            }}
+          >
             Sit back and enjoy the ride
           </p>
           {ride && (
-            <p className="text-brand text-3xl font-black mt-3 font-display">
+            <p className="text-brand font-black text-4xl font-display">
               {fmt(ride.estimated_fare)}
+            </p>
+          )}
+          {ride?.distance_km && (
+            <p
+              className="text-xs mt-1.5"
+              style={{
+                color: isDark ? "rgba(255,255,255,.35)" : "rgba(0,0,0,.35)",
+              }}
+            >
+              {ride.distance_km.toFixed(1)} km
             </p>
           )}
         </div>
@@ -647,36 +1612,60 @@ function ActiveRidePanel({
         initial={{ opacity: 0, scale: 0.95 }}
         animate={{ opacity: 1, scale: 1 }}
       >
-        <div className="bg-brand/5 border-2 border-brand/20 rounded-3xl p-6 text-center">
+        <div
+          className="rounded-3xl p-7 text-center border border-brand/25"
+          style={{ background: "rgba(0,200,83,.07)" }}
+        >
           <motion.div
-            className="text-5xl mb-3"
-            initial={{ rotate: -10 }}
+            className="text-6xl mb-4"
+            initial={{ rotate: -15 }}
             animate={{ rotate: [0, 10, -10, 0] }}
-            transition={{ duration: 0.6 }}
+            transition={{ duration: 0.7 }}
           >
             🏁
           </motion.div>
-          <p className="font-display font-black text-2xl text-zinc-900 dark:text-white">
+          <p
+            className="font-black text-2xl tracking-tight"
+            style={{ color: isDark ? "#fff" : "#0a0a0f" }}
+          >
             Trip Complete!
           </p>
           {ride?.actual_fare && (
-            <p className="text-brand text-4xl font-black mt-2 font-display">
+            <p className="text-brand font-black text-4xl mt-2 font-display">
               {fmt(ride.actual_fare)}
             </p>
           )}
-          <p className="text-zinc-500 text-sm mt-1">
-            {ride?.distance_km?.toFixed(2)} km
-          </p>
+          {ride?.distance_km && (
+            <p
+              className="text-sm mt-1.5"
+              style={{
+                color: isDark ? "rgba(255,255,255,.4)" : "rgba(0,0,0,.4)",
+              }}
+            >
+              {ride.distance_km.toFixed(2)} km covered
+            </p>
+          )}
         </div>
-        <Btn onClick={() => setRatingOpen(true)}>⭐ Rate your driver</Btn>
+        <button
+          onClick={() => setRatingOpen(true)}
+          className="w-full py-4 rounded-2xl font-black text-sm"
+          style={{
+            background: "linear-gradient(135deg,#00C853,#00A843)",
+            color: "#000",
+            boxShadow: "0 4px 20px rgba(0,200,83,.35)",
+          }}
+        >
+          ⭐ Rate your driver
+        </button>
         <Btn variant="ghost" onClick={reset}>
           Done
         </Btn>
       </motion.div>
     );
-
   return null;
 }
+
+// ── Mobile status ──────────────────────────────────────────────────────────────
 
 function MobileStatus({
   stage,
@@ -690,18 +1679,18 @@ function MobileStatus({
   if (stage === S.accepted && driverInfo)
     return (
       <div className="flex items-center gap-3">
-        <div className="w-12 h-12 bg-brand/10 rounded-xl flex items-center justify-center text-xl font-black text-brand font-display flex-shrink-0">
+        <div className="w-12 h-12 bg-brand/10 rounded-xl flex items-center justify-center text-xl font-black text-brand flex-shrink-0">
           {driverInfo.driver_name?.[0]}
         </div>
         <div className="flex-1 min-w-0">
-          <p className="font-semibold text-zinc-900 dark:text-white truncate">
+          <p className="font-bold text-zinc-900 dark:text-white truncate">
             {driverInfo.driver_name}
           </p>
           <p className="text-xs text-zinc-500">
             {driverInfo.vehicle_make} · ETA {driverInfo.eta_minutes}min
           </p>
         </div>
-        <p className="text-brand font-bold font-display flex-shrink-0">
+        <p className="text-brand font-black font-display flex-shrink-0">
           {fmt(ride?.estimated_fare)}
         </p>
       </div>
@@ -710,7 +1699,7 @@ function MobileStatus({
     return (
       <div className="text-center">
         <p className="text-lg font-bold text-zinc-900 dark:text-white">
-          🎯 Driver has arrived!
+          🎯 Driver arrived!
         </p>
         <p className="text-sm text-zinc-500 mt-1">
           Look for{" "}
@@ -737,7 +1726,7 @@ function MobileStatus({
   if (stage === S.completed)
     return (
       <div className="text-center space-y-3">
-        <p className="font-display font-black text-xl text-zinc-900 dark:text-white">
+        <p className="font-black text-xl text-zinc-900 dark:text-white">
           🏁 Trip Complete!
         </p>
         {ride?.actual_fare && (
@@ -758,72 +1747,143 @@ function MobileStatus({
   return null;
 }
 
-function HistoryPanel({ history, fmt }) {
+// ── History + Profile ──────────────────────────────────────────────────────────
+
+function HistoryPanel({ history, fmt, isDark }) {
+  const mutedBg = isDark ? "rgba(255,255,255,.04)" : "rgba(0,0,0,.03)";
   if (history.length === 0)
     return (
       <EmptyState
         icon="🗺️"
         title="No rides yet"
-        subtitle="Your ride history will appear here"
+        subtitle="Your ride history appears here"
       />
     );
   return (
     <div className="space-y-2">
-      <p className="text-xs font-semibold text-zinc-400 uppercase tracking-wider px-1">
-        Your Rides
-      </p>
       {history.map((r, i) => (
-        <Card key={r.ID || i} className="p-4">
+        <div
+          key={r.ID || i}
+          className="p-4 rounded-2xl border"
+          style={{
+            background: mutedBg,
+            borderColor: isDark ? "rgba(255,255,255,.07)" : "rgba(0,0,0,.07)",
+          }}
+        >
           <div className="flex items-start justify-between gap-3">
             <div className="flex-1 min-w-0">
-              <Badge
-                color={
-                  r.Status === "completed"
-                    ? "green"
-                    : r.Status === "cancelled"
-                      ? "red"
-                      : "yellow"
-                }
+              <div className="flex items-center gap-1.5 flex-wrap mb-2">
+                <Badge
+                  color={
+                    r.Status === "completed"
+                      ? "green"
+                      : r.Status === "cancelled"
+                        ? "red"
+                        : r.Status === "scheduled"
+                          ? "blue"
+                          : "yellow"
+                  }
+                >
+                  {r.Status}
+                </Badge>
+                {r.IsScheduled && (
+                  <span
+                    className="text-[10px] px-1.5 py-0.5 rounded-full font-semibold"
+                    style={{
+                      background: "rgba(59,130,246,.12)",
+                      color: "#3b82f6",
+                    }}
+                  >
+                    🕐 Scheduled
+                  </span>
+                )}
+                {r.RideMode === "pool" && (
+                  <span
+                    className="text-[10px] px-1.5 py-0.5 rounded-full font-semibold"
+                    style={{
+                      background: "rgba(0,200,83,.1)",
+                      color: "#00C853",
+                    }}
+                  >
+                    🚌 Pool
+                  </span>
+                )}
+              </div>
+              <p
+                className="text-sm font-semibold truncate"
+                style={{ color: isDark ? "#fff" : "#0a0a0f" }}
               >
-                {r.Status}
-              </Badge>
-              <p className="text-sm font-medium text-zinc-900 dark:text-white mt-2 truncate">
                 {r.PickupAddress || "Pickup"}
               </p>
-              <p className="text-xs text-zinc-400 mt-0.5 truncate">
+              <p
+                className="text-xs mt-0.5 truncate"
+                style={{
+                  color: isDark ? "rgba(255,255,255,.35)" : "rgba(0,0,0,.4)",
+                }}
+              >
                 → {r.DropoffAddress || "Dropoff"}
               </p>
-              <p className="text-xs text-zinc-400 mt-1">
-                {new Date(r.CreatedAt).toLocaleDateString()}
+              <p
+                className="text-xs mt-1"
+                style={{
+                  color: isDark ? "rgba(255,255,255,.25)" : "rgba(0,0,0,.3)",
+                }}
+              >
+                {r.IsScheduled && r.ScheduledAt
+                  ? `📅 ${new Date(r.ScheduledAt).toLocaleString()}`
+                  : new Date(r.CreatedAt).toLocaleDateString()}
               </p>
             </div>
             <div className="text-right flex-shrink-0">
-              <p className="font-display font-bold text-brand">
+              <p className="font-black text-brand">
                 {fmt(r.ActualFare || r.EstimatedFare)}
               </p>
-              <p className="text-xs text-zinc-400">
+              <p
+                className="text-xs mt-0.5"
+                style={{
+                  color: isDark ? "rgba(255,255,255,.3)" : "rgba(0,0,0,.35)",
+                }}
+              >
                 {r.DistanceKm?.toFixed(1)}km
               </p>
             </div>
           </div>
-        </Card>
+        </div>
       ))}
     </div>
   );
 }
 
-function ProfilePanel({ user, logout }) {
+function ProfilePanel({ user, logout, isDark }) {
+  const mutedBg = isDark ? "rgba(255,255,255,.04)" : "rgba(0,0,0,.03)";
   return (
     <div className="space-y-3">
-      <div className="bg-zinc-50 dark:bg-zinc-800 rounded-3xl p-6 text-center">
-        <div className="w-20 h-20 bg-brand/10 rounded-full flex items-center justify-center text-3xl font-black text-brand font-display mx-auto mb-3">
+      <div
+        className="rounded-3xl p-6 text-center border"
+        style={{
+          background: mutedBg,
+          borderColor: isDark ? "rgba(255,255,255,.07)" : "rgba(0,0,0,.07)",
+        }}
+      >
+        <div className="w-20 h-20 bg-brand/10 rounded-full flex items-center justify-center text-3xl font-black text-brand mx-auto mb-3">
           {user?.Name?.[0]}
         </div>
-        <p className="font-display font-bold text-xl text-zinc-900 dark:text-white">
+        <p
+          className="font-black text-xl tracking-tight"
+          style={{ color: isDark ? "#fff" : "#0a0a0f" }}
+        >
           {user?.Name}
         </p>
-        <p className="text-zinc-500 text-sm">{user?.Email}</p>
-        <p className="text-zinc-400 text-xs mt-0.5">{user?.Phone}</p>
+        <p
+          className="text-sm mt-0.5"
+          style={{ color: isDark ? "rgba(255,255,255,.4)" : "rgba(0,0,0,.45)" }}
+        >
+          {user?.Email}
+        </p>
+        <div className="flex items-center justify-center gap-1.5 mt-2">
+          <Shield size={12} className="text-brand" />
+          <p className="text-xs text-brand font-semibold">Verified rider</p>
+        </div>
       </div>
       <Btn variant="danger" onClick={logout}>
         <LogOut size={16} /> Sign Out

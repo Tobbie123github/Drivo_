@@ -1,0 +1,8 @@
+[{
+  "relation": ["delegate_permission/common.handle_all_urls"],
+  "target": {
+    "namespace": "android_app",
+    "package_name": "com.drivo.app",
+    "sha256_cert_fingerprints": ["2D:AF:BD:79:C4:AF:11:FD:3E:66:2A:BA:5C:66:6A:2A:D3:E1:85:0B:D2:D9:A7:F5:89:9E:59:36:57:18:18:89"]
+  }
+}]
