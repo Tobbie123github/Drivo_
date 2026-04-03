@@ -28,7 +28,7 @@ import toast from "react-hot-toast";
 import { BackgroundGeolocation } from "@capgo/background-geolocation";
 import { Network } from "@capacitor/network";
 import { Capacitor } from "@capacitor/core";
-import { requestFCMToken, onForegroundMessage } from "../services/firebase";
+import { getFCMToken, onForegroundMessage } from "../services/firebase";
 import { saveFCMToken } from "../services/api";
 
 const S = {
@@ -147,7 +147,7 @@ export default function Driver() {
       }),
     ];
 
-    requestFCMToken()
+    getFCMToken()
       .then((token) => {
         if (token) saveFCMToken(token).catch(() => {});
       })
