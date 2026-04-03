@@ -8,17 +8,8 @@ import Driver from "./pages/Driver";
 import Admin from "./pages/Admin";
 import Onboarding from "./pages/Onboarding";
 import { Loader } from "lucide-react";
-
-useEffect(() => {
-  CapApp.addListener("appUrlOpen", ({ url }) => {
-    // url will be: https://your-app.vercel.app/reset-password?token=xxx
-    const path = new URL(url).pathname + new URL(url).search;
-    // Navigate react-router to the path
-    window.history.pushState({}, "", path);
-    window.dispatchEvent(new PopStateEvent("popstate"));
-  });
-  return () => CapApp.removeAllListeners();
-}, []);
+import { useEffect } from "react";
+import { App as CapApp } from "@capacitor/app";
 
 function Guard({ children, role }) {
   const { token, role: r, loading } = useAuth();
@@ -95,6 +86,16 @@ function AppRoutes() {
 }
 
 export default function App() {
+  useEffect(() => {
+    CapApp.addListener("appUrlOpen", ({ url }) => {
+      // url will be: https://your-app.vercel.app/reset-password?token=xxx
+      const path = new URL(url).pathname + new URL(url).search;
+      // Navigate react-router to the path
+      window.history.pushState({}, "", path);
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    });
+    return () => CapApp.removeAllListeners();
+  }, []);
   return (
     <ThemeProvider>
       <AuthProvider>
