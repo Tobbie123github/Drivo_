@@ -28,8 +28,6 @@ import toast from "react-hot-toast";
 import { BackgroundGeolocation } from "@capgo/background-geolocation";
 import { Network } from "@capacitor/network";
 import { Capacitor } from "@capacitor/core";
-import { getFCMToken, onForegroundMessage } from "../services/firebase";
-import { saveFCMToken } from "../services/api";
 
 const S = {
   idle: "idle",
@@ -63,6 +61,7 @@ export default function Driver() {
   const [chatActive, setChatActive] = useState(false);
   const [poolModalOpen, setPoolModalOpen] = useState(false);
   const [myPool, setMyPool] = useState(null);
+  const [refreshing, setRefreshing] = useState(false);
 
   const watchId = useRef(null);
   const countdown = useRef(null);
@@ -146,21 +145,6 @@ export default function Driver() {
         );
       }),
     ];
-
-    getFCMToken()
-      .then((token) => {
-        if (token) saveFCMToken(token).catch(() => {});
-      })
-      .catch(() => {});
-
-    const unsubFCM = onForegroundMessage((payload) => {
-      const type = payload.data?.type;
-      // When app is foregrounded and a push arrives, show toast as backup
-      if (type === "ride_request") {
-        toast.success("🔔 New ride request!", { duration: 5000 });
-      }
-    });
-
     return () => {
       u.forEach((f) => f());
       driverWS.disconnect();
@@ -223,14 +207,14 @@ export default function Driver() {
       Network.addListener("networkStatusChange", (s) => {
         if (s.connected) {
           toast("Back online 🟢", { duration: 2000 });
-          driverWS.connect("/ws/driver");
+          setTimeout(() => driverWS.connect("/ws/driver"), 1000);
         } else toast("No internet", { icon: "🔴" });
       });
       return () => Network.removeAllListeners();
     }
     const onOnline = () => {
       toast("Back online 🟢", { duration: 2000 });
-      driverWS.connect("/ws/driver");
+      setTimeout(() => driverWS.connect("/ws/driver"), 500);
     };
     const onOffline = () => toast("No internet — offline", { icon: "🔴" });
     window.addEventListener("online", onOnline);
@@ -411,6 +395,14 @@ export default function Driver() {
     loadProfile();
     loadHistory();
   };
+  const handleRefresh = async () => {
+    if (refreshing) return;
+    setRefreshing(true);
+    driverWS.connect("/ws/driver");
+    await Promise.all([loadHistory(), loadProfile()]).catch(() => {});
+    setTimeout(() => setRefreshing(false), 1200);
+  };
+
   const fmt = (f) => (f ? `₦${Number(f).toLocaleString()}` : "—");
 
   if (checkingOnboarding)
@@ -466,6 +458,8 @@ export default function Driver() {
     onDone,
     myPool,
     onCreatePool: () => setPoolModalOpen(true),
+    onRefresh: handleRefresh,
+    refreshing,
   };
 
   return (
@@ -982,6 +976,8 @@ function SideContent({
   onDone,
   myPool,
   onCreatePool,
+  onRefresh,
+  refreshing,
 }) {
   const borderColor = isDark ? "rgba(255,255,255,.07)" : "rgba(0,0,0,.07)";
   const mutedBg = isDark ? "rgba(255,255,255,.04)" : "rgba(0,0,0,.03)";
@@ -1015,6 +1011,33 @@ function SideContent({
           </p>
         </div>
         <div className="flex items-center gap-2">
+          <button
+            onClick={onRefresh}
+            title="Refresh"
+            className="w-9 h-9 rounded-xl flex items-center justify-center transition-all active:scale-95"
+            style={{
+              background: mutedBg,
+              color: isDark ? "rgba(255,255,255,.5)" : "rgba(0,0,0,.4)",
+            }}
+          >
+            <svg
+              xmlns="http://www.w3.org/2000/svg"
+              width="15"
+              height="15"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2.5"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              style={{ animation: refreshing ? "spin 1s linear infinite" : "" }}
+            >
+              <path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8" />
+              <path d="M21 3v5h-5" />
+              <path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16" />
+              <path d="M8 16H3v5" />
+            </svg>
+          </button>
           <button
             onClick={toggle}
             className="w-9 h-9 rounded-xl flex items-center justify-center text-base"

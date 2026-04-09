@@ -4,6 +4,7 @@ import { useTheme } from "../../context/ThemeContext";
 const KEY = import.meta.env.VITE_MAPTILER_KEY || "";
 const LAGOS = [3.3792, 6.5244];
 
+// ── Style URLs ────────────────────────────────────────────────────────────────
 const STYLES = {
   streets: (dark) =>
     dark
@@ -12,27 +13,42 @@ const STYLES = {
   satellite: () => `https://api.maptiler.com/maps/hybrid/style.json?key=${KEY}`,
 };
 
+// ── MapTiler Directions v2 — road-snapped route ───────────────────────────────
 async function fetchRoute(from, to) {
   if (!KEY) return null;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 8000);
   try {
-    const r = await fetch(
-      `https://api.maptiler.com/directions/v2/driving/${from.lng},${from.lat};${to.lng},${to.lat}?key=${KEY}&geometries=geojson`,
-      { signal: AbortSignal.timeout(6000) },
-    );
-    if (!r.ok) return null;
+    // Use profile=driving, geometries=geojson, steps=false
+    const url = `https://api.maptiler.com/directions/v2/driving/${from.lng},${from.lat};${to.lng},${to.lat}?key=${KEY}&geometries=geojson&steps=false&overview=full`;
+    const r = await fetch(url, { signal: controller.signal });
+    clearTimeout(timeout);
+    if (!r.ok) {
+      console.warn(
+        "[Route] API error:",
+        r.status,
+        await r.text().catch(() => ""),
+      );
+      return null;
+    }
     const d = await r.json();
+    // MapTiler Directions v2 response: { routes: [{ geometry, distance, duration }] }
     const route = d.routes?.[0];
-    if (!route) return null;
+    if (!route?.geometry?.coordinates?.length) return null;
     return {
-      coords: route.geometry.coordinates,
+      coords: route.geometry.coordinates, // [[lng, lat], ...]
       distanceKm: route.distance / 1000,
       durationMin: Math.round(route.duration / 60),
     };
-  } catch {
+  } catch (e) {
+    clearTimeout(timeout);
+    if (e.name !== "AbortError")
+      console.warn("[Route] fetch failed:", e.message);
     return null;
   }
 }
 
+// ── Bezier fallback ───────────────────────────────────────────────────────────
 function bezierCoords(from, to) {
   const dx = to.lng - from.lng,
     dy = to.lat - from.lat;
@@ -68,6 +84,7 @@ function haversineKm(lat1, lng1, lat2, lng2) {
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
+// ── MapLibre loader ───────────────────────────────────────────────────────────
 let mlReady = false,
   mlCbs = [];
 function loadMapLibre() {
@@ -115,7 +132,7 @@ export default function DrivoMap({
   const routeAddedRef = useRef(false);
   const trafficAddedRef = useRef(false);
   const firstDriverFixRef = useRef(false);
-  const currentStyleRef = useRef("streets");
+  const trafficRef = useRef(false); // always up-to-date traffic state
 
   const [mapReady, setMapReady] = useState(false);
   const [is3D, setIs3D] = useState(false);
@@ -123,7 +140,7 @@ export default function DrivoMap({
   const [traffic, setTraffic] = useState(false);
   const [routeInfo, setRouteInfo] = useState(null);
 
-  // Init map
+  // ── Init ──────────────────────────────────────────────────────────────────────
   useEffect(() => {
     let destroyed = false;
     loadMapLibre().then(() => {
@@ -164,9 +181,9 @@ export default function DrivoMap({
       mapRef.current = null;
       window._drivoMapFlyTo = null;
     };
-  }, []);
+  }, []); // eslint-disable-line
 
-  // Style switch (satellite / dark toggle)
+  // ── Style swap (dark / satellite) ────────────────────────────────────────────
   useEffect(() => {
     if (!mapReady || !mapRef.current) return;
     const style = satellite ? STYLES.satellite() : STYLES.streets(isDark);
@@ -175,19 +192,20 @@ export default function DrivoMap({
     trafficAddedRef.current = false;
     mapRef.current.once("styledata", () => {
       tryAdd3DBuildings(mapRef.current);
-      if (traffic) addTrafficRaster(mapRef.current);
+      if (trafficRef.current) addTraffic(mapRef.current);
       if (pickupLoc?.lat && dropoffLoc?.lat) drawRoute(pickupLoc, dropoffLoc);
     });
-  }, [isDark, satellite]);
+  }, [isDark, satellite]); // eslint-disable-line
 
-  // Traffic toggle
+  // ── Traffic ───────────────────────────────────────────────────────────────────
   useEffect(() => {
+    trafficRef.current = traffic;
     if (!mapReady || !mapRef.current) return;
-    if (traffic) addTrafficRaster(mapRef.current);
+    if (traffic) addTraffic(mapRef.current);
     else removeTraffic(mapRef.current);
   }, [traffic, mapReady]);
 
-  // Navigation tilt
+  // ── Navigation tilt ───────────────────────────────────────────────────────────
   useEffect(() => {
     if (!mapReady || !mapRef.current) return;
     const active = ["accepted", "arrived", "ongoing"].includes(stage);
@@ -200,7 +218,7 @@ export default function DrivoMap({
     }
   }, [stage, mapReady]);
 
-  // Pickup marker
+  // ── Pickup marker ─────────────────────────────────────────────────────────────
   useEffect(() => {
     if (!mapReady || !mapRef.current) return;
     pickupMarkerRef.current?.remove();
@@ -219,7 +237,7 @@ export default function DrivoMap({
     });
   }, [pickupLoc, mapReady]);
 
-  // Dropoff + route
+  // ── Dropoff marker + route ────────────────────────────────────────────────────
   useEffect(() => {
     if (!mapReady || !mapRef.current) return;
     dropoffMarkerRef.current?.remove();
@@ -245,9 +263,9 @@ export default function DrivoMap({
         });
       } catch {}
     }
-  }, [dropoffLoc, mapReady]);
+  }, [dropoffLoc, mapReady]); // eslint-disable-line
 
-  // Driver marker
+  // ── Driver marker ─────────────────────────────────────────────────────────────
   useEffect(() => {
     if (!mapReady || !mapRef.current) return;
     if (!driverLoc?.lat) {
@@ -290,9 +308,9 @@ export default function DrivoMap({
           duration: 900,
         });
     }
-  }, [driverLoc, mapReady]);
+  }, [driverLoc, mapReady]); // eslint-disable-line
 
-  // Rider location marker (shown to driver)
+  // ── Rider marker ──────────────────────────────────────────────────────────────
   useEffect(() => {
     if (!mapReady || !mapRef.current || !riderLoc?.lat) return;
     if (riderMarkerRef.current) {
@@ -307,24 +325,35 @@ export default function DrivoMap({
     }
   }, [riderLoc, mapReady]);
 
+  // ── Route drawing ─────────────────────────────────────────────────────────────
   async function drawRoute(from, to) {
     const map = mapRef.current;
     if (!map) return;
     removeRoute();
+
+    // Try real road-snapped route
     const result = await fetchRoute(from, to);
     let coords, distKm, durationMin;
     if (result) {
       coords = result.coords;
       distKm = result.distanceKm;
       durationMin = result.durationMin;
+      console.log(
+        `[Route] Road route: ${distKm.toFixed(1)}km, ${durationMin}min`,
+      );
     } else {
+      // Bezier fallback
       coords = bezierCoords(from, to);
       distKm = haversineKm(from.lat, from.lng, to.lat, to.lng);
       durationMin = Math.round((distKm / 30) * 60);
+      console.log(`[Route] Fallback bezier: ${distKm.toFixed(1)}km`);
     }
+
     setRouteInfo({ distKm, durationMin });
     onRouteCalculated?.(distKm, durationMin);
+
     try {
+      // Add route source
       map.addSource("route", {
         type: "geojson",
         data: {
@@ -332,6 +361,8 @@ export default function DrivoMap({
           geometry: { type: "LineString", coordinates: coords },
         },
       });
+
+      // Glow layer (wide, transparent)
       map.addLayer({
         id: "route-glow",
         type: "line",
@@ -339,22 +370,26 @@ export default function DrivoMap({
         layout: { "line-join": "round", "line-cap": "round" },
         paint: {
           "line-color": "#00C853",
-          "line-width": 18,
-          "line-opacity": 0.08,
-          "line-blur": 10,
+          "line-width": 20,
+          "line-opacity": 0.07,
+          "line-blur": 12,
         },
       });
+
+      // White casing
       map.addLayer({
         id: "route-casing",
         type: "line",
         source: "route",
         layout: { "line-join": "round", "line-cap": "round" },
         paint: {
-          "line-color": isDark ? "#fff" : "#fff",
+          "line-color": "#ffffff",
           "line-width": 9,
-          "line-opacity": isDark ? 0.15 : 0.8,
+          "line-opacity": isDark ? 0.18 : 0.85,
         },
       });
+
+      // Main green line
       map.addLayer({
         id: "route-main",
         type: "line",
@@ -362,18 +397,22 @@ export default function DrivoMap({
         layout: { "line-join": "round", "line-cap": "round" },
         paint: { "line-color": "#00C853", "line-width": 5, "line-opacity": 1 },
       });
+
+      // Animated white dash
       map.addLayer({
         id: "route-dash",
         type: "line",
         source: "route",
         layout: { "line-join": "round", "line-cap": "round" },
         paint: {
-          "line-color": "#fff",
-          "line-width": 2.5,
-          "line-opacity": 0.55,
+          "line-color": "#ffffff",
+          "line-width": 2,
+          "line-opacity": 0.5,
           "line-dasharray": [0, 4, 4],
         },
       });
+
+      // Midpoint label
       const mid = coords[Math.floor(coords.length / 2)];
       const distLabel =
         distKm < 1 ? `${Math.round(distKm * 1000)}m` : `${distKm.toFixed(1)}km`;
@@ -402,8 +441,11 @@ export default function DrivoMap({
           "text-halo-width": 2,
         },
       });
+
       routeAddedRef.current = true;
-    } catch {}
+    } catch (e) {
+      console.warn("[Route] layer error:", e);
+    }
   }
 
   function removeRoute() {
@@ -430,10 +472,10 @@ export default function DrivoMap({
     routeAddedRef.current = false;
   }
 
-  // ── Traffic: use RASTER tiles — these actually work in MapLibre ──────────────
-  // The vector approach requires the style to have traffic source pre-baked.
-  // Raster tiles work reliably as an overlay on any style.
-  function addTrafficRaster(map) {
+  // ── Traffic — raster overlay ──────────────────────────────────────────────────
+  // MapTiler traffic raster tiles work reliably as an overlay on any style.
+  // Vector approach requires pre-baked source in the style — raster doesn't.
+  function addTraffic(map) {
     if (trafficAddedRef.current) return;
     const doAdd = () => {
       try {
@@ -446,36 +488,36 @@ export default function DrivoMap({
             ],
             tileSize: 256,
             minzoom: 0,
-            maxzoom: 16,
+            maxzoom: 22,
           });
         }
-        // Insert below label layers so text stays readable
-        const layers = map.getStyle()?.layers || [];
-        let firstLabelId;
-        for (const l of layers) {
-          if (l.type === "symbol") {
-            firstLabelId = l.id;
-            break;
-          }
-        }
         if (!map.getLayer("traffic-raster-layer")) {
+          // Find first symbol layer to insert below labels
+          const layers = map.getStyle()?.layers || [];
+          let firstSymbol;
+          for (const l of layers) {
+            if (l.type === "symbol") {
+              firstSymbol = l.id;
+              break;
+            }
+          }
           map.addLayer(
             {
               id: "traffic-raster-layer",
               type: "raster",
               source: "traffic-raster",
-              paint: { "raster-opacity": 0.75 },
+              paint: { "raster-opacity": 0.8 },
             },
-            firstLabelId,
+            firstSymbol,
           );
         }
         trafficAddedRef.current = true;
       } catch (e) {
-        console.warn("traffic:", e);
+        console.warn("[Traffic]", e.message);
       }
     };
-    if (map.loaded()) doAdd();
-    else map.once("load", doAdd);
+    if (map.isStyleLoaded()) doAdd();
+    else map.once("styledata", doAdd);
   }
 
   function removeTraffic(map) {
@@ -488,6 +530,7 @@ export default function DrivoMap({
     trafficAddedRef.current = false;
   }
 
+  // ── 3D buildings ──────────────────────────────────────────────────────────────
   function tryAdd3DBuildings(map) {
     try {
       const layers = map.getStyle()?.layers || [];
@@ -536,6 +579,7 @@ export default function DrivoMap({
     } catch {}
   }
 
+  // ── Marker helpers ────────────────────────────────────────────────────────────
   function makePickupEl() {
     const el = document.createElement("div");
     el.style.cssText = "position:relative;width:28px;height:28px;";
@@ -550,10 +594,9 @@ export default function DrivoMap({
     const el = document.createElement("div");
     el.style.cssText = "position:relative;width:30px;height:40px;";
     el.innerHTML = `
-      <svg width="30" height="40" viewBox="0 0 30 40" fill="none" xmlns="http://www.w3.org/2000/svg" style="position:absolute;top:0;left:0;drop-shadow:0 4px 12px rgba(255,59,48,.5)">
+      <svg width="30" height="40" viewBox="0 0 30 40" fill="none" xmlns="http://www.w3.org/2000/svg" style="position:absolute;top:0;left:0;">
         <path d="M15 0C6.716 0 0 6.716 0 15C0 26.25 15 40 15 40C15 40 30 26.25 30 15C30 6.716 23.284 0 15 0Z" fill="#FF3B30"/>
-        <circle cx="15" cy="15" r="7" fill="white"/>
-        <circle cx="15" cy="15" r="3.5" fill="#FF3B30"/>
+        <circle cx="15" cy="15" r="7" fill="white"/><circle cx="15" cy="15" r="3.5" fill="#FF3B30"/>
       </svg>
       <div style="position:absolute;top:-30px;left:50%;transform:translateX(-50%);background:#FF3B30;color:#fff;font-size:9px;font-weight:800;padding:3px 8px;border-radius:6px;white-space:nowrap;font-family:system-ui,sans-serif;letter-spacing:.06em;box-shadow:0 2px 8px rgba(255,59,48,.4);">DROP</div>`;
     return el;

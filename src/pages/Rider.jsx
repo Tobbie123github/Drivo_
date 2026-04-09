@@ -16,18 +16,11 @@ import {
   Zap,
   Shield,
 } from "lucide-react";
-import { rideAPI, ratingAPI } from "../services/api";
+import { rideAPI, ratingAPI, saveFCMToken } from "../services/api";
 import { riderWS } from "../services/websocket";
 import { useAuth } from "../context/AuthContext";
 import { useTheme } from "../context/ThemeContext";
-import {
-  Btn,
-  Badge,
-  Modal,
-  StarRating,
-  EmptyState,
-  Card,
-} from "../components/ui";
+import { Btn, Badge, Modal, StarRating, EmptyState } from "../components/ui";
 import DrivoMap from "../components/map/DrivoMap";
 import LocationSearch from "../components/LocationSearch";
 import ChatBox from "../components/ChatBox";
@@ -38,7 +31,6 @@ import { BackgroundGeolocation } from "@capgo/background-geolocation";
 import { Network } from "@capacitor/network";
 import { Capacitor } from "@capacitor/core";
 import { getFCMToken, onForegroundMessage } from "../services/firebase";
-import { saveFCMToken } from "../services/api";
 
 const S = {
   idle: "idle",
@@ -57,7 +49,7 @@ export default function Rider() {
   const [pickup, setPickup] = useState(null);
   const [dropoff, setDropoff] = useState(null);
   const [driverLoc, setDriverLoc] = useState(null);
-  const [riderLoc, setRiderLoc] = useState(null); // own GPS position
+  const [riderLoc, setRiderLoc] = useState(null);
   const [ride, setRide] = useState(null);
   const [driverInfo, setDriverInfo] = useState(null);
   const [history, setHistory] = useState([]);
@@ -77,12 +69,18 @@ export default function Rider() {
   const [joinedPoolInfo, setJoinedPoolInfo] = useState(null);
   const [chatActive, setChatActive] = useState(false);
   const [routeInfo, setRouteInfo] = useState(null);
+  const [refreshing, setRefreshing] = useState(false);
 
+  // ── Refs to avoid stale closures in WS callbacks ─────────────────────────────
+  // This is the root cause of "stage not updating" — WS handlers registered
+  // on mount capture the initial state values. Using refs ensures they always
+  // see the latest values without needing to re-register handlers.
   const stageRef = useRef(stage);
   const rideRef = useRef(ride);
   const watchId = useRef(null);
   const bgRunning = useRef(false);
 
+  // Keep refs in sync with state
   useEffect(() => {
     stageRef.current = stage;
   }, [stage]);
@@ -90,25 +88,27 @@ export default function Rider() {
     rideRef.current = ride;
   }, [ride]);
 
-  // Persist
+  // ── Persist state ─────────────────────────────────────────────────────────────
   useEffect(() => {
-    const ss = localStorage.getItem("drivo_rider_stage");
-    if (ss && ss !== "idle") setStage(ss);
     try {
-      const sr = localStorage.getItem("drivo_rider_ride");
-      if (sr) setRide(JSON.parse(sr));
+      const s = localStorage.getItem("drivo_rider_stage");
+      if (s && s !== "idle") setStage(s);
     } catch {}
     try {
-      const sp = localStorage.getItem("drivo_rider_pickup");
-      if (sp) setPickup(JSON.parse(sp));
+      const r = localStorage.getItem("drivo_rider_ride");
+      if (r) setRide(JSON.parse(r));
     } catch {}
     try {
-      const sd = localStorage.getItem("drivo_rider_dropoff");
-      if (sd) setDropoff(JSON.parse(sd));
+      const p = localStorage.getItem("drivo_rider_pickup");
+      if (p) setPickup(JSON.parse(p));
     } catch {}
     try {
-      const sdi = localStorage.getItem("drivo_rider_driverinfo");
-      if (sdi) setDriverInfo(JSON.parse(sdi));
+      const d = localStorage.getItem("drivo_rider_dropoff");
+      if (d) setDropoff(JSON.parse(d));
+    } catch {}
+    try {
+      const di = localStorage.getItem("drivo_rider_driverinfo");
+      if (di) setDriverInfo(JSON.parse(di));
     } catch {}
   }, []);
 
@@ -136,56 +136,105 @@ export default function Rider() {
     }
   }, [stage, ride, pickup, dropoff, driverInfo]);
 
-  // WebSocket
+  // ── Reset function — stable reference via useCallback ─────────────────────────
+  // Defined before WS useEffect so it can be used inside handlers safely via ref
+  const resetRef = useRef(null);
+  const reset = useCallback(() => {
+    setStage(S.idle);
+    setPickup(null);
+    setDropoff(null);
+    setRide(null);
+    setDriverInfo(null);
+    setDriverLoc(null);
+    setCancelling(false);
+    setPoolCheck(null);
+    setRideMode("solo");
+    setScheduledAt(null);
+    setChatActive(false);
+    setRouteInfo(null);
+    setJoinedPoolInfo(null);
+    [
+      "drivo_rider_stage",
+      "drivo_rider_ride",
+      "drivo_rider_pickup",
+      "drivo_rider_dropoff",
+      "drivo_rider_driverinfo",
+    ].forEach((k) => localStorage.removeItem(k));
+  }, []);
+  useEffect(() => {
+    resetRef.current = reset;
+  }, [reset]);
+
+  // ── WebSocket — register handlers once, use refs for fresh state ──────────────
   useEffect(() => {
     riderWS.connect("/ws/rider");
-    const u = [
-      riderWS.on("connected", () => setWsOk(true)),
-      riderWS.on("disconnected", () => setWsOk(false)),
+
+    const unsubs = [
+      riderWS.on("connected", () => {
+        setWsOk(true);
+      }),
+
+      riderWS.on("disconnected", () => {
+        setWsOk(false);
+      }),
+
       riderWS.on("ride_accepted", (p) => {
         setDriverInfo(p);
         setStage(S.accepted);
         setChatActive(true);
         toast.success(`🚗 ${p.driver_name} is on the way!`);
       }),
+
       riderWS.on("driver_is_here", () => {
         setStage(S.arrived);
         toast.success("🎯 Your driver has arrived!");
       }),
+
       riderWS.on("ride_started", () => {
         setStage(S.ongoing);
         toast.success("🚀 Trip started!");
       }),
+
       riderWS.on("driver_location", (p) => {
         setDriverLoc({ lat: p.latitude, lng: p.longitude });
       }),
+
       riderWS.on("ride_completed", (p) => {
-        setRide((r) => ({ ...r, ...p }));
+        // Use functional update — never depends on captured ride value
+        setRide((prev) => ({ ...(prev || {}), ...p }));
         setStage(S.completed);
         setChatActive(false);
       }),
+
       riderWS.on("rate_driver", () => {
         setTimeout(() => setRatingOpen(true), 1200);
       }),
+
       riderWS.on("ride_cancelled_by_driver", (p) => {
         toast.error(p?.message || "Driver cancelled");
         setChatActive(false);
-        reset();
+        resetRef.current?.();
       }),
+
       riderWS.on("ride_cancelled_by_rider", () => {
         setChatActive(false);
-        reset();
+        resetRef.current?.();
       }),
+
       riderWS.on("no_candidates", (p) => {
-        toast.error(p?.message || "No drivers available. Please try again.");
-        reset();
+        toast.error(p?.message || "No drivers available. Try again.");
+        resetRef.current?.();
       }),
+
       riderWS.on("pool_ride_available", () => {
         toast("🚌 Pool ride available near you!", { duration: 5000 });
       }),
+
       riderWS.on("pool_ride_updated", (p) => {
         if (p.new_fare) {
-          setRide((r) => ({ ...r, estimated_fare: p.new_fare }));
+          setRide((prev) =>
+            prev ? { ...prev, estimated_fare: p.new_fare } : prev,
+          );
           setJoinedPoolInfo((prev) =>
             prev
               ? {
@@ -198,63 +247,69 @@ export default function Rider() {
           toast.success(p.message || "Pool fare updated!");
         }
       }),
+
       riderWS.on("pool_ride_started", () => {
         setStage(S.ongoing);
         toast.success("🚀 Pool trip started!");
       }),
     ];
 
+    // FCM
     getFCMToken()
       .then((token) => {
         if (token) saveFCMToken(token).catch(() => {});
       })
       .catch(() => {});
-
     const unsubFCM = onForegroundMessage((payload) => {
       const type = payload.data?.type;
-      if (type === "ride_accepted" && stageRef.current === S.idle) {
-        toast.success("🚗 Driver found!");
-      }
       if (type === "driver_arrived") {
         setStage(S.arrived);
-        toast.success("🎯 Your driver has arrived!");
+        toast.success("🎯 Your driver arrived!");
       }
-      if (type === "ride_completed") {
-        setStage(S.completed);
-      }
+      if (type === "ride_completed") setStage(S.completed);
       if (type === "no_candidates") {
-        toast.error("No drivers available. Please try again.");
-        reset();
+        toast.error("No drivers available.");
+        resetRef.current?.();
       }
     });
 
     return () => {
-      u.forEach((f) => f());
+      unsubs.forEach((f) => f?.());
+      if (typeof unsubFCM === "function") unsubFCM();
       riderWS.disconnect();
       stopLocation();
     };
-  }, []);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Network reconnect
+  // ── Network reconnect — native + web ─────────────────────────────────────────
+  // The websocket.js now handles the reconnect properly.
+  // These listeners just trigger a fresh connect() call on data resume.
   useEffect(() => {
     if (Capacitor.isNativePlatform()) {
       Network.addListener("networkStatusChange", (s) => {
+        console.log("[Net] Status changed:", s.connected);
         if (s.connected) {
-          riderWS.connect("/ws/rider");
-          startLocation();
+          // Small delay to let the OS fully establish the connection
+          setTimeout(() => {
+            riderWS.connect("/ws/rider");
+            startLocation();
+          }, 1000);
         }
       });
       return () => Network.removeAllListeners();
     }
     const onOnline = () => {
-      riderWS.connect("/ws/rider");
-      startLocation();
+      console.log("[Net] Online event");
+      setTimeout(() => {
+        riderWS.connect("/ws/rider");
+        startLocation();
+      }, 500);
     };
     window.addEventListener("online", onOnline);
     return () => window.removeEventListener("online", onOnline);
-  }, []);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // GPS — send rider_location_update via WS
+  // ── GPS ───────────────────────────────────────────────────────────────────────
   const startLocation = useCallback(async () => {
     if (Capacitor.isNativePlatform()) {
       if (bgRunning.current) return;
@@ -274,12 +329,11 @@ export default function Rider() {
           }
           const loc = { lat: location.latitude, lng: location.longitude };
           setRiderLoc(loc);
-          if (riderWS.isConnected()) {
+          if (riderWS.isConnected())
             riderWS.send("rider_location_update", {
               latitude: loc.lat,
               longitude: loc.lng,
             });
-          }
         },
       );
     } else {
@@ -288,12 +342,11 @@ export default function Rider() {
         (pos) => {
           const loc = { lat: pos.coords.latitude, lng: pos.coords.longitude };
           setRiderLoc(loc);
-          if (riderWS.isConnected()) {
+          if (riderWS.isConnected())
             riderWS.send("rider_location_update", {
               latitude: loc.lat,
               longitude: loc.lng,
             });
-          }
         },
         () => {},
         { enableHighAccuracy: true, timeout: 10000, maximumAge: 5000 },
@@ -315,12 +368,12 @@ export default function Rider() {
     }
   }, []);
 
-  // Start location when WS connects
+  // Start GPS when WS connects
   useEffect(() => {
     if (wsOk) startLocation();
   }, [wsOk, startLocation]);
 
-  // Pool check
+  // ── Pool check ────────────────────────────────────────────────────────────────
   useEffect(() => {
     if (!pickup?.lat || !dropoff?.lat) {
       setPoolCheck(null);
@@ -347,29 +400,6 @@ export default function Rider() {
     };
   }, [pickup, dropoff]);
 
-  const reset = () => {
-    setStage(S.idle);
-    setPickup(null);
-    setDropoff(null);
-    setRide(null);
-    setDriverInfo(null);
-    setDriverLoc(null);
-    setCancelling(false);
-    setPoolCheck(null);
-    setRideMode("solo");
-    setScheduledAt(null);
-    setChatActive(false);
-    setRouteInfo(null);
-    setJoinedPoolInfo(null);
-    [
-      "drivo_rider_stage",
-      "drivo_rider_ride",
-      "drivo_rider_pickup",
-      "drivo_rider_dropoff",
-      "drivo_rider_driverinfo",
-    ].forEach((k) => localStorage.removeItem(k));
-  };
-
   const loadHistory = async () => {
     try {
       const r = await rideAPI.riderHistory();
@@ -380,6 +410,7 @@ export default function Rider() {
     if (panel === "history") loadHistory();
   }, [panel]);
 
+  // ── Request ride ──────────────────────────────────────────────────────────────
   const requestRide = async () => {
     if (!pickup?.lat || !dropoff?.lat) return;
     if (scheduledAt) {
@@ -421,6 +452,7 @@ export default function Rider() {
           setRide(r.data.ride);
           setJoinedPoolInfo(poolCheck?.pool || null);
           setStage(S.accepted);
+          setChatActive(true);
           toast.success("🚌 Joined pool ride!");
         }
         return;
@@ -435,6 +467,7 @@ export default function Rider() {
     }
   };
 
+  // ── Cancel ride ───────────────────────────────────────────────────────────────
   const cancelRide = async () => {
     if (cancelling) return;
     const rideId =
@@ -483,8 +516,51 @@ export default function Rider() {
   };
 
   const fmt = (f) => (f ? `₦${Number(f).toLocaleString()}` : "—");
+
+  const handleRefresh = async () => {
+    if (refreshing) return;
+    setRefreshing(true);
+    riderWS.connect("/ws/rider");
+    await loadHistory().catch(() => {});
+    setTimeout(() => setRefreshing(false), 1200);
+  };
   const isActiveRide = [S.accepted, S.arrived, S.ongoing].includes(stage);
   const rideId = ride?.ride_id || ride?.ID || ride?.id;
+
+  const sideProps = {
+    user,
+    panel,
+    setPanel,
+    isDark,
+    toggle,
+    wsOk,
+    logout,
+    stage,
+    ride,
+    driverInfo,
+    history,
+    pickup,
+    dropoff,
+    setPickup,
+    setDropoff,
+    reset,
+    requestRide,
+    cancelRide,
+    fmt,
+    setRatingOpen,
+    rideMode,
+    setRideMode,
+    poolCheck,
+    checkingPool,
+    scheduledAt,
+    setScheduledAt,
+    routeInfo,
+    joinedPoolInfo,
+    onSchedule: () => setScheduleOpen(true),
+    onRecurring: () => setRecurringOpen(true),
+    onRefresh: handleRefresh,
+    refreshing,
+  };
 
   return (
     <div
@@ -509,38 +585,7 @@ export default function Rider() {
               exit={{ x: -340 }}
               transition={{ type: "spring", damping: 28, stiffness: 280 }}
             >
-              <SidebarContent
-                user={user}
-                panel={panel}
-                setPanel={setPanel}
-                isDark={isDark}
-                toggle={toggle}
-                wsOk={wsOk}
-                logout={logout}
-                stage={stage}
-                ride={ride}
-                driverInfo={driverInfo}
-                history={history}
-                pickup={pickup}
-                dropoff={dropoff}
-                setPickup={setPickup}
-                setDropoff={setDropoff}
-                reset={reset}
-                requestRide={requestRide}
-                cancelRide={cancelRide}
-                fmt={fmt}
-                setRatingOpen={setRatingOpen}
-                rideMode={rideMode}
-                setRideMode={setRideMode}
-                poolCheck={poolCheck}
-                checkingPool={checkingPool}
-                scheduledAt={scheduledAt}
-                setScheduledAt={setScheduledAt}
-                routeInfo={routeInfo}
-                joinedPoolInfo={joinedPoolInfo}
-                onSchedule={() => setScheduleOpen(true)}
-                onRecurring={() => setRecurringOpen(true)}
-              />
+              <SidebarContent {...sideProps} />
             </motion.div>
           </>
         )}
@@ -554,38 +599,7 @@ export default function Rider() {
           borderColor: isDark ? "rgba(255,255,255,.06)" : "rgba(0,0,0,.07)",
         }}
       >
-        <SidebarContent
-          user={user}
-          panel={panel}
-          setPanel={setPanel}
-          isDark={isDark}
-          toggle={toggle}
-          wsOk={wsOk}
-          logout={logout}
-          stage={stage}
-          ride={ride}
-          driverInfo={driverInfo}
-          history={history}
-          pickup={pickup}
-          dropoff={dropoff}
-          setPickup={setPickup}
-          setDropoff={setDropoff}
-          reset={reset}
-          requestRide={requestRide}
-          cancelRide={cancelRide}
-          fmt={fmt}
-          setRatingOpen={setRatingOpen}
-          rideMode={rideMode}
-          setRideMode={setRideMode}
-          poolCheck={poolCheck}
-          checkingPool={checkingPool}
-          scheduledAt={scheduledAt}
-          setScheduledAt={setScheduledAt}
-          routeInfo={routeInfo}
-          joinedPoolInfo={joinedPoolInfo}
-          onSchedule={() => setScheduleOpen(true)}
-          onRecurring={() => setRecurringOpen(true)}
-        />
+        <SidebarContent {...sideProps} />
       </div>
 
       {/* Map */}
@@ -615,7 +629,7 @@ export default function Rider() {
           >
             <Menu size={20} />
           </button>
-          <div className="ml-auto pointer-events-auto flex items-center gap-2">
+          <div className="ml-auto pointer-events-auto">
             <div
               className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-bold border border-white/20 ${wsOk ? "text-brand" : "text-red-400"}`}
               style={{
@@ -631,9 +645,9 @@ export default function Rider() {
           </div>
         </div>
 
-        {/* Chat */}
+        {/* Chat bubble */}
         <AnimatePresence>
-          {isActiveRide && ride?.ride_mode !== "pool" && rideId && (
+          {isActiveRide && rideId && (
             <motion.div
               className="absolute bottom-24 right-4"
               initial={{ opacity: 0, scale: 0.8 }}
@@ -705,7 +719,7 @@ export default function Rider() {
                   : "rgba(0,0,0,.04)",
               }}
             >
-              <div className="w-14 h-14 bg-brand/10 rounded-2xl flex items-center justify-center text-2xl font-black text-brand font-display">
+              <div className="w-14 h-14 bg-brand/10 rounded-2xl flex items-center justify-center text-2xl font-black text-brand">
                 {driverInfo.driver_name?.[0]}
               </div>
               <div>
@@ -809,6 +823,8 @@ function SidebarContent({
   joinedPoolInfo,
   onSchedule,
   onRecurring,
+  onRefresh,
+  refreshing,
 }) {
   const isIdle = [S.idle, S.searching].includes(stage);
   const borderColor = isDark ? "rgba(255,255,255,.07)" : "rgba(0,0,0,.07)";
@@ -816,7 +832,6 @@ function SidebarContent({
 
   return (
     <div className="flex flex-col h-full">
-      {/* Header */}
       <div
         className="px-5 pt-6 pb-4 flex items-center justify-between flex-shrink-0"
         style={{ borderBottom: `1px solid ${borderColor}` }}
@@ -844,8 +859,35 @@ function SidebarContent({
         </div>
         <div className="flex items-center gap-2">
           <button
+            onClick={onRefresh}
+            title="Refresh"
+            className="w-9 h-9 rounded-xl flex items-center justify-center transition-all active:scale-95"
+            style={{
+              background: mutedBg,
+              color: isDark ? "rgba(255,255,255,.5)" : "rgba(0,0,0,.4)",
+            }}
+          >
+            <svg
+              xmlns="http://www.w3.org/2000/svg"
+              width="15"
+              height="15"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2.5"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              className={refreshing ? "animate-spin" : ""}
+            >
+              <path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8" />
+              <path d="M21 3v5h-5" />
+              <path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16" />
+              <path d="M8 16H3v5" />
+            </svg>
+          </button>
+          <button
             onClick={toggle}
-            className="w-9 h-9 rounded-xl flex items-center justify-center text-base transition-all active:scale-95"
+            className="w-9 h-9 rounded-xl flex items-center justify-center text-base"
             style={{ background: mutedBg }}
           >
             {isDark ? "☀️" : "🌙"}
@@ -857,10 +899,9 @@ function SidebarContent({
         </div>
       </div>
 
-      {/* Greeting */}
       {isIdle && (
         <div
-          className="px-5 py-4 flex-shrink-0"
+          className="px-5 py-3 flex-shrink-0"
           style={{ borderBottom: `1px solid ${borderColor}` }}
         >
           <p
@@ -886,7 +927,6 @@ function SidebarContent({
         </div>
       )}
 
-      {/* Tabs */}
       <div
         className="flex px-3 pt-2 gap-1 flex-shrink-0"
         style={{ borderBottom: `1px solid ${borderColor}` }}
@@ -899,8 +939,7 @@ function SidebarContent({
           <button
             key={k}
             onClick={() => setPanel(k)}
-            className={`flex-1 flex items-center justify-center gap-1.5 py-2.5 rounded-xl text-xs font-bold transition-all mb-2 ${panel === k ? "bg-brand text-black" : "text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-200"}`}
-            style={panel === k ? {} : { background: "transparent" }}
+            className={`flex-1 flex items-center justify-center gap-1.5 py-2.5 rounded-xl text-xs font-bold transition-all mb-2 ${panel === k ? "bg-brand text-black" : "text-zinc-400"}`}
           >
             <span className="text-sm">{icon}</span>
             {label}
@@ -956,7 +995,7 @@ function SidebarContent({
   );
 }
 
-// ── Booking panel ──────────────────────────────────────────────────────────────
+// ── Booking panel ─────────────────────────────────────────────────────────────
 
 function BookingPanel({
   pickup,
@@ -1017,7 +1056,7 @@ function BookingPanel({
             Matching with nearby drivers...
           </p>
           {ride && (
-            <p className="text-brand font-black text-4xl mt-4 font-display">
+            <p className="text-brand font-black text-4xl mt-4">
               {fmt(ride.estimated_fare)}
             </p>
           )}
@@ -1046,7 +1085,6 @@ function BookingPanel({
 
   return (
     <div className="space-y-3">
-      {/* Schedule banner */}
       <AnimatePresence>
         {scheduledAt && (
           <motion.div
@@ -1094,7 +1132,6 @@ function BookingPanel({
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0 }}
           >
-            {/* Route info */}
             {routeInfo && (
               <div
                 className="flex items-center gap-2 px-3.5 py-2.5 rounded-xl border"
@@ -1129,7 +1166,6 @@ function BookingPanel({
               </div>
             )}
 
-            {/* Solo / Pool */}
             <div className="grid grid-cols-2 gap-2">
               {[
                 {
@@ -1193,7 +1229,6 @@ function BookingPanel({
               ))}
             </div>
 
-            {/* Pool info */}
             <AnimatePresence>
               {rideMode === "pool" && poolCheck && (
                 <motion.div
@@ -1240,7 +1275,6 @@ function BookingPanel({
               )}
             </AnimatePresence>
 
-            {/* Schedule + Recurring */}
             <div className="grid grid-cols-2 gap-2">
               {[
                 {
@@ -1308,7 +1342,6 @@ function BookingPanel({
               ))}
             </div>
 
-            {/* CTA */}
             <button
               onClick={requestRide}
               className="w-full py-4 rounded-2xl font-black text-sm tracking-wide flex items-center justify-center gap-2.5 active:scale-[0.98] transition-all"
@@ -1333,7 +1366,7 @@ function BookingPanel({
   );
 }
 
-// ── Active ride panel ──────────────────────────────────────────────────────────
+// ── Active ride panel ─────────────────────────────────────────────────────────
 
 function ActiveRidePanel({
   stage,
@@ -1349,88 +1382,91 @@ function ActiveRidePanel({
   const mutedBg = isDark ? "rgba(255,255,255,.05)" : "rgba(0,0,0,.03)";
   const cardBorder = isDark ? "rgba(255,255,255,.08)" : "rgba(0,0,0,.07)";
 
-  if (stage === S.accepted && driverInfo)
+  // Pool join: joinedPoolInfo is set, driverInfo may be null — show pool card either way
+  if (stage === S.accepted && (driverInfo || joinedPoolInfo))
     return (
       <motion.div
         className="space-y-3"
         initial={{ opacity: 0 }}
         animate={{ opacity: 1 }}
       >
-        {/* Driver card */}
-        <div
-          className="rounded-3xl p-5 border"
-          style={{ background: mutedBg, borderColor: cardBorder }}
-        >
-          <div className="flex items-center gap-3 mb-4">
-            <div className="w-14 h-14 bg-brand/10 rounded-2xl flex items-center justify-center text-2xl font-black text-brand font-display flex-shrink-0">
-              {driverInfo.driver_name?.[0]}
-            </div>
-            <div className="flex-1">
-              <p
-                className="font-black text-base tracking-tight"
-                style={{ color: isDark ? "#fff" : "#0a0a0f" }}
-              >
-                {driverInfo.driver_name}
-              </p>
-              <p
-                className="text-xs mt-0.5"
-                style={{
-                  color: isDark ? "rgba(255,255,255,.4)" : "rgba(0,0,0,.4)",
-                }}
-              >
-                {driverInfo.driver_phone}
-              </p>
-              <div className="flex items-center gap-1 mt-1">
-                <Star size={11} className="text-amber-400 fill-amber-400" />
-                <span
-                  className="text-xs font-bold"
+        {/* Only show driver card if we have driver info (solo rides) */}
+        {driverInfo && (
+          <div
+            className="rounded-3xl p-5 border"
+            style={{ background: mutedBg, borderColor: cardBorder }}
+          >
+            <div className="flex items-center gap-3 mb-4">
+              <div className="w-14 h-14 bg-brand/10 rounded-2xl flex items-center justify-center text-2xl font-black text-brand flex-shrink-0">
+                {driverInfo.driver_name?.[0]}
+              </div>
+              <div className="flex-1">
+                <p
+                  className="font-black text-base tracking-tight"
+                  style={{ color: isDark ? "#fff" : "#0a0a0f" }}
+                >
+                  {driverInfo.driver_name}
+                </p>
+                <p
+                  className="text-xs mt-0.5"
                   style={{
-                    color: isDark ? "rgba(255,255,255,.7)" : "rgba(0,0,0,.7)",
+                    color: isDark ? "rgba(255,255,255,.4)" : "rgba(0,0,0,.4)",
                   }}
                 >
-                  {driverInfo.rating?.toFixed(1)}
-                </span>
+                  {driverInfo.driver_phone}
+                </p>
+                <div className="flex items-center gap-1 mt-1">
+                  <Star size={11} className="text-amber-400 fill-amber-400" />
+                  <span
+                    className="text-xs font-bold"
+                    style={{
+                      color: isDark ? "rgba(255,255,255,.7)" : "rgba(0,0,0,.7)",
+                    }}
+                  >
+                    {driverInfo.rating?.toFixed(1)}
+                  </span>
+                </div>
               </div>
-            </div>
-            <div className="text-right">
               <span className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-xl bg-brand/10 text-brand text-xs font-black">
                 ETA {driverInfo.eta_minutes}m
               </span>
             </div>
+            <div
+              className="grid grid-cols-3 gap-2 rounded-2xl p-3"
+              style={{
+                background: isDark
+                  ? "rgba(255,255,255,.04)"
+                  : "rgba(0,0,0,.04)",
+              }}
+            >
+              {[
+                ["Make", driverInfo.vehicle_make || "—"],
+                ["Model", driverInfo.vehicle_model || "—"],
+                ["Plate", driverInfo.plate_number || "—"],
+              ].map(([l, v]) => (
+                <div key={l}>
+                  <p
+                    className="text-[10px]"
+                    style={{
+                      color: isDark
+                        ? "rgba(255,255,255,.35)"
+                        : "rgba(0,0,0,.4)",
+                    }}
+                  >
+                    {l}
+                  </p>
+                  <p
+                    className="text-xs font-bold mt-0.5 truncate"
+                    style={{ color: isDark ? "#fff" : "#0a0a0f" }}
+                  >
+                    {v}
+                  </p>
+                </div>
+              ))}
+            </div>
           </div>
-          <div
-            className="grid grid-cols-3 gap-2 rounded-2xl p-3"
-            style={{
-              background: isDark ? "rgba(255,255,255,.04)" : "rgba(0,0,0,.04)",
-            }}
-          >
-            {[
-              ["Make", driverInfo.vehicle_make || "—"],
-              ["Model", driverInfo.vehicle_model || "—"],
-              ["Plate", driverInfo.plate_number || "—"],
-            ].map(([l, v]) => (
-              <div key={l}>
-                <p
-                  className="text-[10px]"
-                  style={{
-                    color: isDark ? "rgba(255,255,255,.35)" : "rgba(0,0,0,.4)",
-                  }}
-                >
-                  {l}
-                </p>
-                <p
-                  className="text-xs font-bold mt-0.5 truncate"
-                  style={{ color: isDark ? "#fff" : "#0a0a0f" }}
-                >
-                  {v}
-                </p>
-              </div>
-            ))}
-          </div>
-        </div>
-
-        {/* Pool joined card */}
-        {joinedPoolInfo && ride?.ride_mode === "pool" && (
+        )}
+        {joinedPoolInfo && (
           <div
             className="rounded-2xl p-4 border border-brand/25"
             style={{ background: "rgba(0,200,83,.07)" }}
@@ -1481,7 +1517,6 @@ function ActiveRidePanel({
             </p>
           </div>
         )}
-
         <button
           onClick={cancelRide}
           className="w-full py-3.5 rounded-2xl text-sm font-bold text-red-400 border border-red-500/20 active:scale-[0.98] transition-all"
@@ -1587,7 +1622,7 @@ function ActiveRidePanel({
             Sit back and enjoy the ride
           </p>
           {ride && (
-            <p className="text-brand font-black text-4xl font-display">
+            <p className="text-brand font-black text-4xl">
               {fmt(ride.estimated_fare)}
             </p>
           )}
@@ -1631,7 +1666,7 @@ function ActiveRidePanel({
             Trip Complete!
           </p>
           {ride?.actual_fare && (
-            <p className="text-brand font-black text-4xl mt-2 font-display">
+            <p className="text-brand font-black text-4xl mt-2">
               {fmt(ride.actual_fare)}
             </p>
           )}
@@ -1662,10 +1697,11 @@ function ActiveRidePanel({
         </Btn>
       </motion.div>
     );
+
   return null;
 }
 
-// ── Mobile status ──────────────────────────────────────────────────────────────
+// ── Mobile status ─────────────────────────────────────────────────────────────
 
 function MobileStatus({
   stage,
@@ -1690,7 +1726,7 @@ function MobileStatus({
             {driverInfo.vehicle_make} · ETA {driverInfo.eta_minutes}min
           </p>
         </div>
-        <p className="text-brand font-black font-display flex-shrink-0">
+        <p className="text-brand font-black flex-shrink-0">
           {fmt(ride?.estimated_fare)}
         </p>
       </div>
@@ -1718,7 +1754,7 @@ function MobileStatus({
           </p>
           <p className="text-sm text-zinc-500">Heading to destination</p>
         </div>
-        <p className="text-brand font-black text-xl font-display">
+        <p className="text-brand font-black text-xl">
           {fmt(ride?.estimated_fare)}
         </p>
       </div>
@@ -1730,7 +1766,7 @@ function MobileStatus({
           🏁 Trip Complete!
         </p>
         {ride?.actual_fare && (
-          <p className="text-brand text-3xl font-black font-display">
+          <p className="text-brand text-3xl font-black">
             {fmt(ride.actual_fare)}
           </p>
         )}
@@ -1747,7 +1783,7 @@ function MobileStatus({
   return null;
 }
 
-// ── History + Profile ──────────────────────────────────────────────────────────
+// ── History + Profile ─────────────────────────────────────────────────────────
 
 function HistoryPanel({ history, fmt, isDark }) {
   const mutedBg = isDark ? "rgba(255,255,255,.04)" : "rgba(0,0,0,.03)";
